@@ -1,0 +1,70 @@
+{
+  "minecraft": {
+    "servers": [
+      {
+        "id": "norat",
+        "enabled": false,
+        "host": "norat.pw",
+        "port": 25565,
+        "version": "26.1",
+        "username": "noratbot",
+        "channelId": null
+      }
+    ],
+
+    "connection": {
+      "autoReconnect": true,
+      "reconnectDelay": 3000,
+      "maxReconnectDelay": 5000
+    }
+  },
+
+  "discord": {
+    "enabled": false,
+    "token": null,
+    "clientId": null,
+    "link": null,
+    "trustedId": null,
+    "adminId": null,
+    "messagesId": null,
+    "commandPrefix": "!"
+  },
+
+  "bot": {
+    "prefix": ["nr:", "norat:", "noratbot:", "no:", "nrb:", "nb:", "nr;", "norat;", "noratbot;", "no;", "nrb;", "nb;"],
+    "commandSpy": true,
+    "creative": true,
+    "selfCare": true,
+    "unmute": true,
+    "vanish": true,
+    "trustedKey": null,
+    "adminKey": null,
+    "authList": {
+      "admin": [],
+      "trusted": []
+    },
+  },
+
+  "core": {
+    "enabled": true,
+    "survivorMaxAge": 60000,
+    "area": {
+      "size": 8,
+      "y": 1
+    },
+
+    "refill": {
+      "enabled": true,
+      "block": "repeating_command_block",
+      "mode": "replace"
+    }
+  },
+
+  "logging": {
+    "chat": true,
+    "commands": false,
+    "plugins": true,
+    "uuid": false,
+    "debug": false
+  }
+}

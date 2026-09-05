@@ -1,0 +1,28 @@
+{
+  "dependencies": {
+    "@deeplx/core": "^0.2.2",
+    "@mongodb-js/zstd": "^7.0.0",
+    "@tonejs/midi": "^2.0.28",
+    "@vitalets/google-translate-api": "^9.2.1",
+    "axios": "^1.20.0",
+    "crypto": "^1.0.1",
+    "discord.js": "^14.27.0",
+    "express": "^5.2.1",
+    "jimp": "^0.16.0",
+    "js-sha3": "^0.13.0",
+    "midi-parser-js": "^4.0.4",
+    "minecraft-data": "^3.113.2",
+    "minecraft-protocol": "^1.67.0",
+    "minecraft-toolkit": "^2.0.0",
+    "mineflayer": "^4.37.1",
+    "os": "^0.1.2",
+    "prismarine-chunk": "^1.41.0",
+    "prismarine-registry": "^1.12.0",
+    "sleep-promise": "^9.1.0",
+    "socket.io": "^4.8.3",
+    "tweetnacl": "^1.0.3",
+    "util": "^0.12.5",
+    "vec3": "^0.2.0",
+    "wikipedia": "^2.5.0"
+  }
+}
