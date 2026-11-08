@@ -1,0 +1,133 @@
+
+name: NoratBot
+
+on:
+  schedule:
+    # Start a fresh session every 4 hours (UTC)
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: noratbot-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 235
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate configuration
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          BOT_TRUSTED_KEY: ${{ secrets.BOT_TRUSTED_KEY }}
+          BOT_ADMIN_KEY: ${{ secrets.BOT_ADMIN_KEY }}
+        run: |
+          set -e
+
+          test -f config.example.json
+
+          : "${DISCORD_TOKEN:?Missing DISCORD_TOKEN}"
+          : "${BOT_TRUSTED_KEY:?Missing BOT_TRUSTED_KEY}"
+          : "${BOT_ADMIN_KEY:?Missing BOT_ADMIN_KEY}"
+
+          jq \
+            --arg token "$DISCORD_TOKEN" \
+            --arg trusted "$BOT_TRUSTED_KEY" \
+            --arg admin "$BOT_ADMIN_KEY" \
+            '
+            .discord.token = $token |
+            .bot.trustedKey = $trusted |
+            .bot.adminKey = $admin
+            ' config.example.json > config.json.tmp
+
+          mv config.json.tmp config.json
+
+      - name: Run bot with automatic crash recovery
+        shell: bash
+        run: |
+          RUN_WINDOW_SECONDS=13800
+          RESTART_DELAY=10
+
+          deadline=$((SECONDS + RUN_WINDOW_SECONDS))
+
+          echo "Starting NoratBot supervisor."
+
+          while (( SECONDS < deadline )); do
+            remaining=$((deadline - SECONDS))
+
+            echo "Starting node index.js"
+
+            set +e
+            timeout \
+              --signal=INT \
+              --kill-after=30s \
+              "${remaining}s" \
+              node index.js
+
+            exit_code=$?
+            set -e
+
+            if (( SECONDS >= RUN_WINDOW_SECONDS )) || (( exit_code == 124 )); then
+              echo "Session time limit reached."
+              break
+            fi
+
+            echo "Bot exited with code $exit_code."
+            echo "Restarting in ${RESTART_DELAY} seconds..."
+
+            sleep "$RESTART_DELAY"
+          done
+
+          echo "Bot session finished."
+
+      - name: Commit and push bot changes
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -e
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote set-url origin \
+            "https://github.com/${GITHUB_REPOSITORY}.git"
+
+          # Add everything except config and dependencies.
+          git add -A -- . \
+            ':(exclude)config.json' \
+            ':(exclude)node_modules/**'
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git -c core.hooksPath=/dev/null commit \
+            -m "chore: persist bot data"
+
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+
+          git -c http.extraheader="$AUTH_HEADER" \
+            push origin "HEAD:${GITHUB_REF_NAME}"
+
+          echo "Changes successfully pushed."
