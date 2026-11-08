@@ -21,18 +21,17 @@ const cmdDir = path.join(process.cwd(), 'discordcommands');
 
 const COLORS = {
     default: 0x5865F2,
+    public: 0x5865F2,
+    trusted: 0x57F287,
+    admin: 0xF1C40F,
     success: 0x57F287,
     error: 0xED4245,
     warning: 0xFEE75C,
-    chat: 0x2B2D31,
-    status: 0x3498DB
+    chat: 0x2B2D31
 };
 
 function formatReason(r) {
-    if (Array.isArray(r)) {
-        return r.map(formatReason).join(', ');
-    }
-
+    if (Array.isArray(r)) return r.map(formatReason).join(', ');
     if (typeof r === 'string') return r;
 
     if (r && typeof r === 'object') {
@@ -76,7 +75,9 @@ function createEmbed(description, options = {}) {
     }
 
     if (options.footer) {
-        embed.setFooter({ text: String(options.footer).slice(0, 2048) });
+        embed.setFooter({
+            text: String(options.footer).slice(0, 2048)
+        });
     }
 
     if (options.author) {
@@ -89,7 +90,6 @@ function createEmbed(description, options = {}) {
     return embed;
 }
 
-// Split long output without breaking Discord's embed description limit.
 function splitText(text, limit = 3900) {
     text = String(text ?? '');
 
@@ -104,9 +104,7 @@ function splitText(text, limit = 3900) {
             cut = text.lastIndexOf(' ', limit);
         }
 
-        if (cut < limit * 0.5) {
-            cut = limit;
-        }
+        if (cut < limit * 0.5) cut = limit;
 
         result.push(text.slice(0, cut));
         text = text.slice(cut).replace(/^\n+/, '');
@@ -141,10 +139,17 @@ async function sendEmbed(channel, description, options = {}) {
 async function sendCommandOutput(msg, output, options = {}) {
     if (output == null || output === '') return;
 
+    const replyOptions = {
+        allowedMentions: {
+            parse: [],
+            repliedUser: false
+        }
+    };
+
     if (output instanceof EmbedBuilder) {
         await msg.reply({
-            embeds: [output],
-            allowedMentions: { parse: [], repliedUser: false }
+            ...replyOptions,
+            embeds: [output]
         }).catch(console.error);
 
         return;
@@ -152,8 +157,8 @@ async function sendCommandOutput(msg, output, options = {}) {
 
     if (output?.embed instanceof EmbedBuilder) {
         await msg.reply({
-            embeds: [output.embed],
-            allowedMentions: { parse: [], repliedUser: false }
+            ...replyOptions,
+            embeds: [output.embed]
         }).catch(console.error);
 
         return;
@@ -162,8 +167,10 @@ async function sendCommandOutput(msg, output, options = {}) {
     if (typeof output === 'object' && output.description) {
         await sendEmbed(msg.channel, output.description, {
             title: output.title,
-            color: output.color ?? COLORS.default
+            color: output.color ?? options.color ?? COLORS.default,
+            footer: 'noratbot • Discord'
         });
+
         return;
     }
 
@@ -583,6 +590,12 @@ function toPlain(x) {
     return x.replace(/§[0-9a-fk-or]/gi, '');
 }
 
+function getRankColor(level) {
+    if (level >= 2) return COLORS.admin;
+    if (level >= 1) return COLORS.trusted;
+    return COLORS.public;
+}
+
 // Discord command execution
 async function handleCommand(client, msg) {
     const args = msg.content
@@ -609,17 +622,21 @@ async function handleCommand(client, msg) {
             if (result instanceof EmbedBuilder) {
                 await sendCommandOutput(msg, result);
             } else if (result?.embed) {
-                await sendCommandOutput(msg, result.embed);
+                await sendCommandOutput(msg, result);
             } else if (typeof result === 'string') {
                 await sendCommandOutput(msg, result);
             }
         } catch (e) {
             console.error(`[Discord] Command error (${name}):`, e);
 
-            await sendCommandOutput(msg, 'An error occurred while executing this command.', {
-                color: COLORS.error,
-                title: 'Command error'
-            });
+            await sendCommandOutput(
+                msg,
+                'An error occurred while executing this command.',
+                {
+                    color: COLORS.error,
+                    title: 'Command error'
+                }
+            );
         }
 
         return true;
@@ -627,7 +644,7 @@ async function handleCommand(client, msg) {
 
     const dconf = bot.globalConfig?.discord || {};
 
-    // Resolve the actual Discord member's rank.
+    // Resolve actual Discord member roles.
     const member = msg.member ||
         await msg.guild.members.fetch(msg.author.id).catch(() => null);
 
@@ -651,15 +668,29 @@ async function handleCommand(client, msg) {
         ADMIN: 2
     };
 
-    const requiredLevel = Number.isFinite(Number(cmd.level))
-        ? Number(cmd.level)
-        : 0;
-
     const rankName = level === 2
         ? 'ADMIN'
         : level === 1
             ? 'TRUSTED'
             : 'PUBLIC';
+
+    const rankColor = getRankColor(level);
+
+    function resolveRequiredLevel(value) {
+        if (typeof value === 'string') {
+            const normalized = value.toUpperCase();
+
+            if (Object.prototype.hasOwnProperty.call(levels, normalized)) {
+                return levels[normalized];
+            }
+        }
+
+        const number = Number(value);
+
+        return Number.isFinite(number) ? number : 0;
+    }
+
+    const requiredLevel = resolveRequiredLevel(cmd.level);
 
     if (requiredLevel > level) {
         const requiredName = Object.entries(levels)
@@ -707,7 +738,8 @@ async function handleCommand(client, msg) {
     const send = text => {
         return sendCommandOutput(msg, String(text ?? ''), {
             title: 'Command response',
-            color: COLORS.default
+            color: rankColor,
+            footer: `noratbot • ${rankName}`
         });
     };
 
@@ -729,13 +761,11 @@ async function handleCommand(client, msg) {
         message: msg,
         prefix: global.commandPrefix,
 
-        // Actual Discord user's permission level.
         level,
         rank: rankName,
+        levels,
 
         source: 'discord',
-
-        levels,
 
         commands,
 
@@ -743,7 +773,7 @@ async function handleCommand(client, msg) {
 
         core: bot.core,
 
-        // Redirect tellraw output into Discord embeds.
+        // Redirect tellraw output to colored Discord embeds.
         run: async x => {
             const command = String(x);
 
@@ -902,25 +932,8 @@ module.exports = function discordBridge(bot) {
 
     const INTERVAL = 900;
     const MAX_BUF = 50;
+    const MAX_MESSAGE_LENGTH = 1900;
     const GROUP = true;
-
-    async function statusMsg(text, color = COLORS.status) {
-        if (!global.clientReady) return;
-
-        try {
-            const ch = await global.discordClient.channels.fetch(cid);
-
-            if (!ch) return;
-
-            await sendEmbed(ch, text, {
-                title: 'Minecraft server status',
-                color,
-                footer: `noratbot • ${bot.id}`
-            });
-        } catch (e) {
-            console.error(`[${bot.id}] [Discord] Status error:`, e);
-        }
-    }
 
     async function flush() {
         if (!buf.length) return;
@@ -937,13 +950,30 @@ module.exports = function discordBridge(bot) {
                 return;
             }
 
-            const text = messages.join('\n');
+            // Normal Minecraft chat remains plain code blocks.
+            let combined = messages.join('\n');
 
-            await sendEmbed(ch, text, {
-                title: 'Minecraft chat',
-                color: COLORS.chat,
-                footer: `noratbot • ${bot.id}`
-            });
+            while (combined.length > 0) {
+                let chunk = combined.slice(0, MAX_MESSAGE_LENGTH);
+
+                if (combined.length > MAX_MESSAGE_LENGTH) {
+                    const newline = chunk.lastIndexOf('\n');
+
+                    if (newline > MAX_MESSAGE_LENGTH * 0.5) {
+                        chunk = chunk.slice(0, newline);
+                    }
+                }
+
+                await ch.send({
+                    content: `\`\`\`\n${chunk}\n\`\`\``,
+                    allowedMentions: {
+                        parse: [],
+                        repliedUser: false
+                    }
+                });
+
+                combined = combined.slice(chunk.length).replace(/^\n+/, '');
+            }
 
         } catch (e) {
             console.error(`[${bot.id}] [Discord] Chat send error:`, e);
@@ -953,7 +983,7 @@ module.exports = function discordBridge(bot) {
     function addMsg(text) {
         if (!text || !String(text).trim()) return;
 
-        const safeText = String(text).replaceAll('`', '\\`');
+        const safeText = String(text).replaceAll('`', '\u200b`');
 
         if (buf.length >= MAX_BUF) {
             buf.shift();
@@ -978,26 +1008,8 @@ module.exports = function discordBridge(bot) {
     }
 
     const handlers = {
-        onConnecting(host, port) {
-            statusMsg(
-                `Attempting to connect to **${host}:${port}**...`,
-                COLORS.warning
-            );
-        },
-
-        onConnected() {
-            statusMsg(
-                'Successfully connected to the Minecraft server.',
-                COLORS.success
-            );
-        },
-
-        onDisconnect(reason) {
-            statusMsg(
-                `Disconnected from the Minecraft server.\n\n**Reason:** ${formatReason(reason)}`,
-                COLORS.error
-            );
-
+        onDisconnect() {
+            // No server status messages.
             if (timer) {
                 clearTimeout(timer);
                 timer = null;
@@ -1012,8 +1024,7 @@ module.exports = function discordBridge(bot) {
         }
     };
 
-    bot.on('bot:connecting', handlers.onConnecting);
-    bot.on('bot:connected', handlers.onConnected);
+    // Only chat and disconnect listeners are needed.
     bot.on('bot:disconnect', handlers.onDisconnect);
     bot.on('chat_display', handlers.onChatDisplay);
 
@@ -1025,8 +1036,6 @@ module.exports = function discordBridge(bot) {
 
         buf = [];
 
-        bot.removeListener('bot:connecting', handlers.onConnecting);
-        bot.removeListener('bot:connected', handlers.onConnected);
         bot.removeListener('bot:disconnect', handlers.onDisconnect);
         bot.removeListener('chat_display', handlers.onChatDisplay);
 
