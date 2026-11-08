@@ -4,7 +4,10 @@ const {
     GatewayIntentBits,
     Partials,
     ChannelType,
-    EmbedBuilder
+    EmbedBuilder,
+    REST,
+    Routes,
+    SlashCommandBuilder
 } = require('discord.js');
 
 const fs = require('fs');
@@ -16,6 +19,7 @@ if (!global.channelMap) global.channelMap = new Map();
 if (!global.discordCommands) global.discordCommands = new Map();
 if (!global.commandPrefix) global.commandPrefix = '!';
 if (!global.processedMessages) global.processedMessages = new Set();
+if (!global.slashSyncQueue) global.slashSyncQueue = Promise.resolve();
 
 const cmdDir = path.join(process.cwd(), 'discordcommands');
 
@@ -578,7 +582,6 @@ async function handleCommand(client, msg) {
     const bot = global.channelMap.get(msg.channel.id);
     const cmd = bot?.commands?.get(name);
 
-    // Discord-only commands
     if (!cmd) {
         const dc = global.discordCommands.get(name);
 
@@ -612,7 +615,6 @@ async function handleCommand(client, msg) {
 
     const dconf = bot.globalConfig?.discord || {};
 
-    // Resolve the actual Discord member.
     const member = msg.member ||
         await msg.guild.members.fetch(msg.author.id).catch(() => null);
 
@@ -623,7 +625,6 @@ async function handleCommand(client, msg) {
         return roles.has(String(id));
     };
 
-    // ADMIN takes priority over TRUSTED.
     const level = hasRole(dconf.adminId)
         ? 2
         : hasRole(dconf.trustedId)
@@ -704,24 +705,20 @@ async function handleCommand(client, msg) {
     }
 
     const discordPlayer = {
-        // Keep the Minecraft identity unchanged.
         name: username,
         uuid,
 
-        // Discord user's permissions.
         level,
         rank: rankName,
         permissionLevel: level,
         permission: rankName.toLowerCase(),
         role: rankName.toLowerCase(),
 
-        // Minecraft identity aliases.
         minecraftName: username,
         minecraftUUID: uuid,
 
-        // Discord identity.
         discordId: msg.author.id,
-        discordTag: msg.author.tag,
+        discordTag: msg.author.tag || msg.author.username,
         discordUsername: msg.author.username,
         discordDisplayName: member?.displayName || msg.author.username
     };
@@ -744,7 +741,7 @@ async function handleCommand(client, msg) {
 
         discord: {
             id: msg.author.id,
-            tag: msg.author.tag,
+            tag: msg.author.tag || msg.author.username,
             username: msg.author.username,
             displayName: member?.displayName || msg.author.username,
             rank: rankName,
@@ -830,6 +827,270 @@ async function handleCommand(client, msg) {
     return true;
 }
 
+// --------------------------------------------------
+// SLASH COMMAND REGISTRATION
+// --------------------------------------------------
+
+function getSlashCommands() {
+    const registered = new Map();
+
+    for (const bot of global.channelMap.values()) {
+        if (!bot.commands?.all) continue;
+
+        for (const cmd of bot.commands.all()) {
+            if (!cmd?.name) continue;
+
+            const name = String(cmd.name).toLowerCase();
+
+            if (!/^[a-z0-9_-]{1,32}$/.test(name)) continue;
+
+            if (registered.has(name)) continue;
+
+            const description = String(
+                cmd.description || `Execute ${name}`
+            ).replace(/\s+/g, ' ').slice(0, 100);
+
+            const builder = new SlashCommandBuilder()
+                .setName(name)
+                .setDescription(description || `Execute ${name}`)
+                .addStringOption(option =>
+                    option
+                        .setName('args')
+                        .setDescription('Command arguments')
+                        .setRequired(false)
+                        .setAutocomplete(true)
+                );
+
+            registered.set(name, builder);
+        }
+    }
+
+    return [...registered.values()];
+}
+
+async function syncSlashCommands(client) {
+    if (!client.isReady()) return;
+
+    const commands = getSlashCommands();
+
+    const rest = new REST({ version: '10' })
+        .setToken(client.token);
+
+    await rest.put(
+        Routes.applicationCommands(client.user.id),
+        {
+            body: commands.map(command => command.toJSON())
+        }
+    );
+
+    console.log(
+        `[Discord] Registered ${commands.length} slash commands.`
+    );
+}
+
+function scheduleSlashSync(client) {
+    global.slashSyncQueue = global.slashSyncQueue
+        .then(() => syncSlashCommands(client))
+        .catch(e => {
+            console.error('[Discord] Slash registration error:', e);
+        });
+
+    return global.slashSyncQueue;
+}
+
+// --------------------------------------------------
+// SLASH COMMAND AUTOCOMPLETE
+// --------------------------------------------------
+
+async function handleAutocomplete(interaction) {
+    const bot = global.channelMap.get(interaction.channelId);
+
+    if (!bot?.tabComplete) {
+        return interaction.respond([]);
+    }
+
+    const cmd = bot.commands?.get(interaction.commandName);
+
+    if (!cmd) {
+        return interaction.respond([]);
+    }
+
+    const focused = interaction.options.getFocused(true);
+
+    if (focused.name !== 'args') {
+        return interaction.respond([]);
+    }
+
+    const input = `/${interaction.commandName} ${focused.value}`;
+
+    try {
+        // Discord autocomplete has a short response deadline.
+        const results = await Promise.race([
+            bot.tabComplete(input),
+            new Promise((_, reject) =>
+                setTimeout(
+                    () => reject(new Error('Autocomplete deadline exceeded')),
+                    2200
+                )
+            )
+        ]);
+
+        const choices = [];
+        const seen = new Set();
+
+        for (const result of results || []) {
+            let value = String(result).trim();
+
+            const prefixes = [
+                `/${interaction.commandName} `,
+                `${interaction.commandName} `
+            ];
+
+            for (const prefix of prefixes) {
+                if (value.startsWith(prefix)) {
+                    value = value.slice(prefix.length);
+                    break;
+                }
+            }
+
+            if (!value || value.length > 100 || seen.has(value)) {
+                continue;
+            }
+
+            seen.add(value);
+
+            choices.push({
+                name: value,
+                value
+            });
+
+            if (choices.length >= 25) break;
+        }
+
+        await interaction.respond(choices);
+
+    } catch (e) {
+        console.error('[Discord] Autocomplete error:', e);
+
+        await interaction.respond([]).catch(() => {});
+    }
+}
+
+// --------------------------------------------------
+// SLASH COMMAND EXECUTION
+// --------------------------------------------------
+
+async function handleSlashCommand(interaction, client) {
+    const bot = global.channelMap.get(interaction.channelId);
+
+    if (!bot) {
+        return interaction.reply({
+            embeds: [
+                createEmbed(
+                    'No Minecraft bot is registered in this channel.',
+                    {
+                        title: 'Command unavailable',
+                        color: COLORS.error
+                    }
+                )
+            ],
+            ephemeral: true
+        });
+    }
+
+    const cmd = bot.commands?.get(interaction.commandName);
+
+    if (!cmd) {
+        return interaction.reply({
+            embeds: [
+                createEmbed('This command is no longer available.', {
+                    color: COLORS.error
+                })
+            ],
+            ephemeral: true
+        });
+    }
+
+    const args = interaction.options.getString('args') || '';
+
+    const member = await interaction.guild.members
+        .fetch(interaction.user.id)
+        .catch(() => null);
+
+    if (!member) {
+        return interaction.reply({
+            content: 'Unable to verify your Discord permissions.',
+            ephemeral: true
+        });
+    }
+
+    await interaction.deferReply();
+
+    let replyCount = 0;
+
+    const fakeMsg = {
+        content: `${global.commandPrefix}${interaction.commandName}${args ? ` ${args}` : ''}`,
+
+        author: interaction.user,
+        member,
+        guild: interaction.guild,
+
+        channel: {
+            id: interaction.channelId,
+            isTextBased: () => true
+        },
+
+        attachments: new Map(),
+        reference: null,
+
+        reply: async payload => {
+            if (replyCount++ === 0) {
+                return interaction.editReply(payload);
+            }
+
+            return interaction.followUp(payload);
+        }
+    };
+
+    try {
+        const handled = await handleCommand(client, fakeMsg);
+
+        if (!handled) {
+            await interaction.editReply({
+                embeds: [
+                    createEmbed('Command could not be executed.', {
+                        color: COLORS.error
+                    })
+                ]
+            });
+        } else if (replyCount === 0) {
+            await interaction.editReply({
+                content: 'Command executed.',
+                embeds: []
+            });
+        }
+
+    } catch (e) {
+        console.error('[Discord] Slash execution error:', e);
+
+        await interaction.editReply({
+            embeds: [
+                createEmbed(
+                    `An error occurred while executing this command.\n\`\`\`\n${String(e.message || e).slice(0, 1000)}\n\`\`\``,
+                    {
+                        title: 'Command error',
+                        color: COLORS.error
+                    }
+                )
+            ]
+        }).catch(() => {});
+    }
+}
+
+// --------------------------------------------------
+// DISCORD CLIENT
+// --------------------------------------------------
+
 function setupDC(config) {
     if (global.discordClient) return;
 
@@ -853,6 +1114,35 @@ function setupDC(config) {
         loadCmds();
 
         console.log(`[Discord] Logged in as ${client.user.tag}`);
+
+        scheduleSlashSync(client);
+    });
+
+    client.on('interactionCreate', async interaction => {
+        try {
+            if (interaction.isAutocomplete()) {
+                await handleAutocomplete(interaction);
+                return;
+            }
+
+            if (interaction.isChatInputCommand()) {
+                await handleSlashCommand(interaction, client);
+            }
+
+        } catch (e) {
+            console.error('[Discord] Interaction error:', e);
+
+            if (
+                interaction.isRepliable() &&
+                !interaction.replied &&
+                !interaction.deferred
+            ) {
+                await interaction.reply({
+                    content: 'An unexpected error occurred.',
+                    ephemeral: true
+                }).catch(() => {});
+            }
+        }
     });
 
     client.on('messageCreate', async msg => {
@@ -888,6 +1178,10 @@ function setupDC(config) {
     });
 }
 
+// --------------------------------------------------
+// BRIDGE INITIALIZATION
+// --------------------------------------------------
+
 module.exports = function discordBridge(bot) {
     const gconf = bot.globalConfig;
     const dconf = gconf?.discord;
@@ -913,6 +1207,10 @@ module.exports = function discordBridge(bot) {
         );
 
         return;
+    }
+
+    if (global.clientReady && global.discordClient) {
+        scheduleSlashSync(global.discordClient);
     }
 
     let buf = [];
@@ -1018,6 +1316,10 @@ module.exports = function discordBridge(bot) {
 
         if (global.channelMap.get(cid) === bot) {
             global.channelMap.delete(cid);
+
+            if (global.clientReady && global.discordClient) {
+                scheduleSlashSync(global.discordClient);
+            }
         }
 
         if (bot.discordBridgeDestroy === destroy) {
