@@ -26,40 +26,8 @@ const COLORS = {
     admin: 0xF1C40F,
     success: 0x57F287,
     error: 0xED4245,
-    warning: 0xFEE75C,
-    chat: 0x2B2D31
+    warning: 0xFEE75C
 };
-
-function formatReason(r) {
-    if (Array.isArray(r)) return r.map(formatReason).join(', ');
-    if (typeof r === 'string') return r;
-
-    if (r && typeof r === 'object') {
-        if (r.text) return r.text;
-
-        if (r.translate || r.key) {
-            const key = r.translate || r.key;
-            const args = r.with || r.arguments || [];
-
-            return `[${key}]` + (
-                Array.isArray(args)
-                    ? ' ' + args.map(a => {
-                        if (typeof a === 'string') return a;
-                        if (a?.text) return a.text;
-                        if (a?.translate) return `[${a.translate}]`;
-                        return String(a);
-                    }).join(', ')
-                    : ''
-            );
-        }
-
-        if (r.extra) return formatReason(r.extra);
-        if (r.description) return r.description;
-        if (r.message) return r.message;
-    }
-
-    return String(r);
-}
 
 function createEmbed(description, options = {}) {
     const embed = new EmbedBuilder()
@@ -80,19 +48,11 @@ function createEmbed(description, options = {}) {
         });
     }
 
-    if (options.author) {
-        embed.setAuthor({
-            name: String(options.author).slice(0, 256),
-            ...(options.iconURL ? { iconURL: options.iconURL } : {})
-        });
-    }
-
     return embed;
 }
 
 function splitText(text, limit = 3900) {
     text = String(text ?? '');
-
     if (!text) return [];
 
     const result = [];
@@ -121,13 +81,13 @@ async function sendEmbed(channel, description, options = {}) {
     const chunks = splitText(description);
 
     for (let i = 0; i < chunks.length; i++) {
-        const embed = createEmbed(chunks[i], {
-            ...options,
-            title: i === 0 ? options.title : undefined
-        });
-
         await channel.send({
-            embeds: [embed],
+            embeds: [
+                createEmbed(chunks[i], {
+                    ...options,
+                    title: i === 0 ? options.title : undefined
+                })
+            ],
             allowedMentions: {
                 parse: [],
                 repliedUser: false
@@ -139,45 +99,57 @@ async function sendEmbed(channel, description, options = {}) {
 async function sendCommandOutput(msg, output, options = {}) {
     if (output == null || output === '') return;
 
-    const replyOptions = {
-        allowedMentions: {
-            parse: [],
-            repliedUser: false
-        }
-    };
-
     if (output instanceof EmbedBuilder) {
+        if (output.data.color == null) {
+            output.setColor(options.color ?? COLORS.default);
+        }
+
         await msg.reply({
-            ...replyOptions,
-            embeds: [output]
-        }).catch(console.error);
-
-        return;
-    }
-
-    if (output?.embed instanceof EmbedBuilder) {
-        await msg.reply({
-            ...replyOptions,
-            embeds: [output.embed]
-        }).catch(console.error);
-
-        return;
-    }
-
-    if (typeof output === 'object' && output.description) {
-        await sendEmbed(msg.channel, output.description, {
-            title: output.title,
-            color: output.color ?? options.color ?? COLORS.default,
-            footer: 'noratbot • Discord'
+            embeds: [output],
+            allowedMentions: {
+                parse: [],
+                repliedUser: false
+            }
         });
 
         return;
     }
 
-    await sendEmbed(msg.channel, String(output), {
-        color: options.color ?? COLORS.default,
-        title: options.title ?? 'Command response',
-        footer: options.footer ?? 'noratbot • Discord'
+    if (output?.embed instanceof EmbedBuilder) {
+        await sendCommandOutput(msg, output.embed, options);
+        return;
+    }
+
+    if (typeof output === 'object' && output.description) {
+        await msg.reply({
+            embeds: [
+                createEmbed(output.description, {
+                    title: output.title,
+                    color: output.color ?? options.color ?? COLORS.default,
+                    footer: options.footer
+                })
+            ],
+            allowedMentions: {
+                parse: [],
+                repliedUser: false
+            }
+        });
+
+        return;
+    }
+
+    await msg.reply({
+        embeds: [
+            createEmbed(String(output), {
+                title: options.title ?? 'Command response',
+                color: options.color ?? COLORS.default,
+                footer: options.footer ?? 'noratbot • Discord'
+            })
+        ],
+        allowedMentions: {
+            parse: [],
+            repliedUser: false
+        }
     });
 }
 
@@ -234,11 +206,9 @@ function toSNBT(obj) {
     return "''";
 }
 
-// Discord -> Minecraft chat
 async function handleMsg(bot, msg) {
     try {
-        const hasCore = await waitCore(bot);
-        if (!hasCore) return;
+        if (!await waitCore(bot)) return;
 
         const atts = [];
 
@@ -418,7 +388,6 @@ function loadCmds() {
     }
 }
 
-// SNBT parser
 function parseSNBT(src) {
     let i = 0;
 
@@ -596,7 +565,6 @@ function getRankColor(level) {
     return COLORS.public;
 }
 
-// Discord command execution
 async function handleCommand(client, msg) {
     const args = msg.content
         .slice(global.commandPrefix.length)
@@ -622,7 +590,7 @@ async function handleCommand(client, msg) {
             if (result instanceof EmbedBuilder) {
                 await sendCommandOutput(msg, result);
             } else if (result?.embed) {
-                await sendCommandOutput(msg, result);
+                await sendCommandOutput(msg, result.embed);
             } else if (typeof result === 'string') {
                 await sendCommandOutput(msg, result);
             }
@@ -644,7 +612,7 @@ async function handleCommand(client, msg) {
 
     const dconf = bot.globalConfig?.discord || {};
 
-    // Resolve actual Discord member roles.
+    // Resolve the actual Discord member.
     const member = msg.member ||
         await msg.guild.members.fetch(msg.author.id).catch(() => null);
 
@@ -735,6 +703,29 @@ async function handleCommand(client, msg) {
         }
     }
 
+    const discordPlayer = {
+        // Keep the Minecraft identity unchanged.
+        name: username,
+        uuid,
+
+        // Discord user's permissions.
+        level,
+        rank: rankName,
+        permissionLevel: level,
+        permission: rankName.toLowerCase(),
+        role: rankName.toLowerCase(),
+
+        // Minecraft identity aliases.
+        minecraftName: username,
+        minecraftUUID: uuid,
+
+        // Discord identity.
+        discordId: msg.author.id,
+        discordTag: msg.author.tag,
+        discordUsername: msg.author.username,
+        discordDisplayName: member?.displayName || msg.author.username
+    };
+
     const send = text => {
         return sendCommandOutput(msg, String(text ?? ''), {
             title: 'Command response',
@@ -747,33 +738,38 @@ async function handleCommand(client, msg) {
         bot,
         bots: bot.manager?.bots || new Map(),
 
-        player: {
-            name: username,
-            uuid
+        player: discordPlayer,
+        user: discordPlayer,
+        member,
+
+        discord: {
+            id: msg.author.id,
+            tag: msg.author.tag,
+            username: msg.author.username,
+            displayName: member?.displayName || msg.author.username,
+            rank: rankName,
+            level,
+            permissionLevel: level,
+            member
         },
-
-        command: cmd,
-        commandName: cmd.name || name,
-        args,
-
-        raw: [name, ...args].join(' '),
-
-        message: msg,
-        prefix: global.commandPrefix,
 
         level,
         rank: rankName,
         levels,
 
+        command: cmd,
+        commandName: cmd.name || name,
+        args,
+        raw: [name, ...args].join(' '),
+
+        message: msg,
+        prefix: global.commandPrefix,
         source: 'discord',
 
         commands,
-
         commandsDir: path.join(process.cwd(), 'commands'),
-
         core: bot.core,
 
-        // Redirect tellraw output to colored Discord embeds.
         run: async x => {
             const command = String(x);
 
@@ -798,26 +794,22 @@ async function handleCommand(client, msg) {
             return bot.core?.run(command);
         },
 
-        tellraw: async (who, x) => {
-            return send(toPlain(x));
-        },
-
-        tellrawCommand: async x => {
-            return send(toPlain(x));
-        },
-
-        reply: async x => {
-            return send(x);
-        }
+        tellraw: async (who, x) => send(toPlain(x)),
+        tellrawCommand: async x => send(toPlain(x)),
+        reply: async x => send(x)
     };
 
     try {
         const result = await cmd.execute(ctx);
 
         if (result instanceof EmbedBuilder) {
-            await sendCommandOutput(msg, result);
+            await sendCommandOutput(msg, result, {
+                color: rankColor
+            });
         } else if (result?.embed) {
-            await sendCommandOutput(msg, result.embed);
+            await sendCommandOutput(msg, result.embed, {
+                color: rankColor
+            });
         } else if (typeof result === 'string' && result.trim()) {
             await send(result);
         }
@@ -838,7 +830,6 @@ async function handleCommand(client, msg) {
     return true;
 }
 
-// Discord client setup
 function setupDC(config) {
     if (global.discordClient) return;
 
@@ -859,7 +850,6 @@ function setupDC(config) {
 
     client.once('ready', () => {
         global.clientReady = true;
-
         loadCmds();
 
         console.log(`[Discord] Logged in as ${client.user.tag}`);
@@ -868,7 +858,6 @@ function setupDC(config) {
     client.on('messageCreate', async msg => {
         if (msg.author.bot) return;
         if (!msg.guild) return;
-
         if (msg.channel.type !== ChannelType.GuildText) return;
 
         if (msg.content.startsWith(global.commandPrefix)) {
@@ -899,7 +888,6 @@ function setupDC(config) {
     });
 }
 
-// Main bridge
 module.exports = function discordBridge(bot) {
     const gconf = bot.globalConfig;
     const dconf = gconf?.discord;
@@ -933,7 +921,6 @@ module.exports = function discordBridge(bot) {
     const INTERVAL = 900;
     const MAX_BUF = 50;
     const MAX_MESSAGE_LENGTH = 1900;
-    const GROUP = true;
 
     async function flush() {
         if (!buf.length) return;
@@ -945,12 +932,8 @@ module.exports = function discordBridge(bot) {
         try {
             const ch = await global.discordClient.channels.fetch(cid);
 
-            if (!ch) {
-                console.error(`[${bot.id}] [Discord] Channel not found.`);
-                return;
-            }
+            if (!ch) return;
 
-            // Normal Minecraft chat remains plain code blocks.
             let combined = messages.join('\n');
 
             while (combined.length > 0) {
@@ -989,11 +972,7 @@ module.exports = function discordBridge(bot) {
             buf.shift();
         }
 
-        if (
-            GROUP &&
-            buf.length > 0 &&
-            buf[buf.length - 1] === safeText
-        ) {
+        if (buf.length > 0 && buf[buf.length - 1] === safeText) {
             return;
         }
 
@@ -1009,7 +988,6 @@ module.exports = function discordBridge(bot) {
 
     const handlers = {
         onDisconnect() {
-            // No server status messages.
             if (timer) {
                 clearTimeout(timer);
                 timer = null;
@@ -1024,7 +1002,6 @@ module.exports = function discordBridge(bot) {
         }
     };
 
-    // Only chat and disconnect listeners are needed.
     bot.on('bot:disconnect', handlers.onDisconnect);
     bot.on('chat_display', handlers.onChatDisplay);
 
