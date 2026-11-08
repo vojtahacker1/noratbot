@@ -2,13 +2,11 @@
 name: NoratBot
 
 on:
-  schedule:
-    # Start a fresh session every 4 hours (UTC)
-    - cron: "0 */4 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: noratbot-${{ github.ref }}
@@ -17,7 +15,7 @@ concurrency:
 jobs:
   bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 235
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -40,7 +38,7 @@ jobs:
           BOT_TRUSTED_KEY: ${{ secrets.BOT_TRUSTED_KEY }}
           BOT_ADMIN_KEY: ${{ secrets.BOT_ADMIN_KEY }}
         run: |
-          set -e
+          set -euo pipefail
 
           test -f config.example.json
 
@@ -63,12 +61,14 @@ jobs:
       - name: Run bot with automatic crash recovery
         shell: bash
         run: |
-          RUN_WINDOW_SECONDS=13800
+          set -euo pipefail
+
+          RUN_WINDOW_SECONDS=14100
           RESTART_DELAY=10
 
           deadline=$((SECONDS + RUN_WINDOW_SECONDS))
 
-          echo "Starting NoratBot supervisor."
+          echo "NoratBot supervisor started."
 
           while (( SECONDS < deadline )); do
             remaining=$((deadline - SECONDS))
@@ -78,14 +78,14 @@ jobs:
             set +e
             timeout \
               --signal=INT \
-              --kill-after=30s \
+              --kill-after=15s \
               "${remaining}s" \
               node index.js
 
             exit_code=$?
             set -e
 
-            if (( SECONDS >= RUN_WINDOW_SECONDS )) || (( exit_code == 124 )); then
+            if (( SECONDS >= deadline )); then
               echo "Session time limit reached."
               break
             fi
@@ -98,13 +98,15 @@ jobs:
 
           echo "Bot session finished."
 
+
       - name: Commit and push bot changes
+        id: persist
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -112,22 +114,60 @@ jobs:
           git remote set-url origin \
             "https://github.com/${GITHUB_REPOSITORY}.git"
 
-          # Add everything except config and dependencies.
-          git add -A -- . \
-            ':(exclude)config.json' \
-            ':(exclude)node_modules/**'
+          # Ensure generated files are always ignored.
+          touch .gitignore
+
+          for entry in "/config.json" "/config.json.tmp" "/node_modules/"; do
+            if ! grep -Fxq "$entry" .gitignore; then
+              echo "$entry" >> .gitignore
+            fi
+          done
+
+          # Remove generated files from Git tracking without deleting them.
+          git rm -r --cached --ignore-unmatch -- \
+            config.json config.json.tmp node_modules
+
+          # Stage all other changes normally.
+          git add -A
 
           if git diff --cached --quiet; then
             echo "No changes to commit."
-            exit 0
+          else
+            git -c core.hooksPath=/dev/null commit \
+              -m "chore: persist bot data"
+
+            AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+
+            git -c http.extraheader="$AUTH_HEADER" \
+              push origin "HEAD:${GITHUB_REF_NAME}"
           fi
 
-          git -c core.hooksPath=/dev/null commit \
-            -m "chore: persist bot data"
+          echo "Changes persisted successfully."
 
-          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
 
-          git -c http.extraheader="$AUTH_HEADER" \
-            push origin "HEAD:${GITHUB_REF_NAME}"
+      - name: Automatically start next session
+        if: steps.persist.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          echo "Changes successfully pushed."
+          echo "Finding NoratBot workflow..."
+
+          WORKFLOW_ID="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows" \
+            --jq '[.workflows[] | select(.name == "NoratBot" and .state == "active")] | first | .id')"
+
+          if [[ -z "$WORKFLOW_ID" || "$WORKFLOW_ID" == "null" ]]; then
+            echo "Could not find NoratBot workflow."
+            exit 1
+          fi
+
+          echo "Dispatching next session..."
+
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_ID}/dispatches" \
+            -f ref="$GITHUB_REF_NAME"
+
+          echo "Next session successfully queued."
