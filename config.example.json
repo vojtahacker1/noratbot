@@ -1,0 +1,97 @@
+{
+  "minecraft": {
+        "servers": [
+      {
+        "id": "chomens",
+        "enabled": true,
+        "host": "chayapak.chipmunk.land",
+        "port": 25565,
+        "version": "26.1",
+        "username": "norat_bot",
+        "channelId": "1532880964852912360"
+      },
+      {
+        "id": "hceboom",
+        "enabled": true,
+        "host": "kaboom.hcesaropz.dev",
+        "port": 25565,
+        "version": "26.1",
+        "username": "norat_bot",
+        "channelId": "1532881552009203812"
+      },
+      {
+        "id": "kaboom",
+        "enabled": true,
+        "host": "kaboom.pw",
+        "port": 25565,
+        "version": "26.1",
+        "username": "norat_bot",
+        "channelId": "1450456463871971481"
+      },
+      {
+        "id": "chipmunk",
+        "enabled": true,
+        "host": "chipmunk.land",
+        "port": 17891,
+        "version": "26.1",
+        "username": "norat_bot",
+        "channelId": "1450456420343480370"
+      }
+    ],
+
+    "connection": {
+      "autoReconnect": true,
+      "reconnectDelay": 3000,
+      "maxReconnectDelay": 5000
+    }
+  },
+
+  "discord": {
+    "enabled": true,
+    "token": "",
+    "clientId": "1565768137276784642",
+    "link": "youare.qzz.io",
+    "trustedId": "1450509583360725002",
+    "adminId": "1450487330409287832",
+    "messagesId": "1565770761023652022",
+    "commandPrefix": "!"
+  },
+
+  "bot": {
+    "prefix": ["nr:", "norat:", "noratbot:", "no:", "nrb:", "nb:", "nr;", "norat;", "noratbot;", "no;", "nrb;", "nb;", "."],
+    "commandSpy": true,
+    "creative": true,
+    "selfCare": true,
+    "unmute": true,
+    "vanish": true,
+    "trustedKey": "",
+    "adminKey": "",
+    "authList": {
+      "admin": ["dfngbrth", "VojtaV12", "Taube"],
+      "trusted": []
+    }
+  },
+
+  "core": {
+    "enabled": true,
+    "survivorMaxAge": 60000,
+    "area": {
+      "size": 64,
+      "y": 30
+    },
+
+    "refill": {
+      "enabled": true,
+      "block": "repeating_command_block",
+      "mode": "replace"
+    }
+  },
+
+  "logging": {
+    "chat": true,
+    "commands": true,
+    "plugins": true,
+    "uuid": false,
+    "debug": false
+  }
+}
