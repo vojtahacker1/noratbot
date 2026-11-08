@@ -9,7 +9,6 @@ if (!global.channelMap) global.channelMap = new Map();
 if (!global.discordCommands) global.discordCommands = new Map();
 if (!global.commandPrefix) global.commandPrefix = '!';
 if (!global.processedMessages) global.processedMessages = new Set();
-if (!global.commandsChannelId) global.commandsChannelId = null;
 
 const cmdDir = path.join(process.cwd(), 'discordcommands');
 
@@ -255,10 +254,171 @@ function loadCmds() {
     }
 }
 
+// ---- Discord command support (output goes to Discord only, never to the Minecraft server) ----
+
+function parseSNBT(src) {
+    let i = 0;
+    const ws = () => { while (i < src.length && /\s/.test(src[i])) i++; };
+    function str(q) {
+        let out = '';
+        i++;
+        while (i < src.length && src[i] !== q) {
+            if (src[i] === '\\') {
+                i++;
+                out += src[i] === 'n' ? '\n' : src[i];
+                i++;
+                continue;
+            }
+            out += src[i++];
+        }
+        i++;
+        return out;
+    }
+    function val() {
+        ws();
+        const c = src[i];
+        if (c === '{') {
+            i++;
+            const o = {};
+            ws();
+            while (src[i] !== '}') {
+                ws();
+                let k;
+                if (src[i] === "'" || src[i] === '"') k = str(src[i]);
+                else { const m = /^[A-Za-z0-9_.+\-]+/.exec(src.slice(i)); k = m[0]; i += k.length; }
+                ws(); i++; // :
+                o[k] = val();
+                ws();
+                if (src[i] === ',') i++;
+                ws();
+            }
+            i++;
+            return o;
+        }
+        if (c === '[') {
+            i++;
+            const a = [];
+            ws();
+            while (src[i] !== ']') {
+                a.push(val());
+                ws();
+                if (src[i] === ',') i++;
+                ws();
+            }
+            i++;
+            return a;
+        }
+        if (c === "'" || c === '"') return str(c);
+        const m = /^[^,\]}\s]+/.exec(src.slice(i));
+        i += m[0].length;
+        if (m[0] === 'true') return true;
+        if (m[0] === 'false') return false;
+        return isNaN(Number(m[0])) ? m[0] : Number(m[0]);
+    }
+    return val();
+}
+
+function plainText(x) {
+    if (x == null) return '';
+    if (typeof x === 'string') return x;
+    if (typeof x === 'number' || typeof x === 'boolean') return String(x);
+    if (Array.isArray(x)) return x.map(plainText).join('');
+    let t = typeof x.text === 'string' ? x.text : '';
+    if (!t && x.translate) t = `[${x.translate}]`;
+    if (x.extra) t += plainText(x.extra);
+    return t;
+}
+
+function toPlain(x) {
+    if (typeof x !== 'string') return plainText(x).replace(/§[0-9a-fk-or]/gi, '');
+    return x.replace(/§[0-9a-fk-or]/gi, '');
+}
+
+async function handleCommand(client, msg) {
+    const args = msg.content.slice(global.commandPrefix.length).trim().split(/\s+/);
+    const name = args.shift()?.toLowerCase();
+    if (!name) return false;
+
+    const send = text => {
+        const out = String(text ?? '').trim();
+        if (!out) return true;
+        msg.reply({ content: out.slice(0, 1990), allowedMentions: { parse: [], repliedUser: false } }).catch(() => {});
+        return true;
+    };
+
+    // The channel decides which server's bot runs the command
+    const bot = global.channelMap.get(msg.channel.id);
+    const cmd = bot?.commands?.get(name);
+
+    if (!cmd) {
+        // plain Discord-only commands from /discordcommands
+        const dc = global.discordCommands.get(name);
+        if (!dc) return false;
+        try {
+            const r = await dc.execute(msg, args, client, null);
+            if (typeof r === 'string' && r) await msg.reply(r);
+            else if (r instanceof EmbedBuilder) await msg.reply({ embeds: [r] });
+            else if (r?.embed) await msg.reply({ embeds: [r.embed] });
+        } catch (e) {
+            console.error(`[Discord] Command error (${name}):`, e);
+            await msg.reply('Command error').catch(() => {});
+        }
+        return true;
+    }
+
+    const dconf = bot.globalConfig?.discord || {};
+    const has = id => id && msg.member?.roles?.cache?.has(String(id));
+    const level = has(dconf.adminId) ? 2 : has(dconf.trustedId) ? 1 : 0;
+    if (cmd.level > level) { send('Permission denied. Required level: ' + cmd.level); return true; }
+
+    const username = bot.config.username;
+    const uuid = bot.commands.getPlayerUUID(username);
+    if (!uuid) { send('Bot UUID unavailable'); return true; }
+
+    const ctx = {
+        bot,
+        bots: bot.manager?.bots || new Map(),
+        player: { name: username, uuid },
+        command: cmd,
+        commandName: cmd.name,
+        args,
+        raw: [name, ...args].join(' '),
+        message: msg,
+        prefix: global.commandPrefix,
+        level,
+        source: 'discord',
+        levels: { PUBLIC: 0, TRUSTED: 1, ADMIN: 2 },
+        commands: new Map(bot.commands.all().flatMap(c => [[c.name, c], ...(c.aliases || []).map(x => [x, c])])),
+        commandsDir: path.join(process.cwd(), 'commands'),
+        core: bot.core,
+        // tellraw output is redirected to Discord; everything else still runs on the server
+        run: x => {
+            const m = /^\/?tellraw\s+\S+\s+([\s\S]+)$/.exec(String(x));
+            if (m) {
+                let comp;
+                try { comp = JSON.parse(m[1]); } catch { try { comp = parseSNBT(m[1]); } catch { comp = m[1]; } }
+                return send(toPlain(comp));
+            }
+            return bot.core?.run(x);
+        },
+        tellraw: (who, x) => send(toPlain(x)),
+        tellrawCommand: x => send(toPlain(x)),
+        reply: x => send(x)
+    };
+
+    try {
+        const r = await cmd.execute(ctx);
+        if (typeof r === 'string' && r) send(r);
+    } catch (e) {
+        console.error(e);
+        send('Command error: ' + e.message);
+    }
+    return true;
+}
+
 function setupDC(config) {
     if (global.discordClient) return;
     global.commandPrefix = config.commandPrefix || '!';
-    global.commandsChannelId = config.messagesId || null;
 
     const client = new Client({
         intents: [
@@ -274,7 +434,6 @@ function setupDC(config) {
     client.once('ready', () => {
         global.clientReady = true;
         loadCmds();
-        if (!global.commandsChannelId) console.log('[Discord] No commands channel configured (messagesId missing)');
     });
 
     client.on('messageCreate', async msg => {
@@ -283,27 +442,9 @@ function setupDC(config) {
         const ch = msg.channel;
         if (!ch || ch.type !== 0) return;
 
-        if (global.commandsChannelId && ch.id === global.commandsChannelId) {
-            if (msg.content.startsWith(global.commandPrefix)) {
-                const args = msg.content.slice(global.commandPrefix.length).trim().split(/\s+/);
-                const cmdName = args.shift().toLowerCase();
-                const cmd = global.discordCommands.get(cmdName);
-                if (cmd) {
-                    try {
-                        const result = await cmd.execute(msg, args, client, null);
-                        if (result) {
-                            if (typeof result === 'string') await msg.reply(result);
-                            else if (result instanceof EmbedBuilder) await msg.reply({ embeds: [result] });
-                            else if (result.embed) await msg.reply({ embeds: [result.embed] });
-                        }
-                    } catch (e) {
-                        console.error(`[Discord] Command error (${cmdName}):`, e);
-                        await msg.reply('Command error');
-                    }
-                }
-                return;
-            }
-            return;
+        // "!cmd" in a server's channel runs that server's bot command; output stays in Discord only
+        if (msg.content.startsWith(global.commandPrefix)) {
+            if (await handleCommand(client, msg)) return;
         }
 
         const target = global.channelMap.get(ch.id);

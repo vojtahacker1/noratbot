@@ -150,6 +150,7 @@ class BotInstance extends EventEmitter {
         let disconnectSent = false; 
 
         client.on('login', () => {
+            this.connectedAt = Date.now();
             this.reconnectAttempts = 0;
             this.pendingReconnect = false;
             this._connecting = false;
@@ -193,6 +194,7 @@ class BotInstance extends EventEmitter {
                 this.emit('bot:disconnect', finalReason);
             }
             this.ready = false;
+            this.connectedAt = null;
             this.started = false;
             this._connecting = false;
             client.removeAllListeners();

@@ -33,6 +33,7 @@ module.exports = function core(bot) {
             reset() { return false; },
             refill() { return false; },
             run() { return false; },
+            runTracked() { return Promise.resolve(null); },
             destroy() { this.ready = false; }
         };
         return;
@@ -398,6 +399,143 @@ module.exports = function core(bot) {
     bot.on('position', handlers.onPosition);
     bot.on('end', handlers.onEnd);
 
+    // ---- tracked output: query the command block's LastOutput via nbt query ----
+    const nbtQueries = new Map();
+    let nbtTransactionId = 1;
+
+    function findKey(node, wanted) {
+        if (!node || typeof node !== 'object') return undefined;
+        if (Object.prototype.hasOwnProperty.call(node, wanted)) return node[wanted];
+        for (const value of Object.values(node)) {
+            const found = findKey(value, wanted);
+            if (found !== undefined) return found;
+        }
+        return undefined;
+    }
+
+    // typed nbt ({type, value}) -> plain js. 1.21.5+ stores LastOutput as a text component
+    // compound instead of a JSON string, so this has to cope with both
+    function simplifyNbt(node) {
+        if (node === null || typeof node !== 'object') return node;
+        if (Array.isArray(node)) return node.map(simplifyNbt);
+        if (typeof node.type === 'string' && 'value' in node) {
+            const v = node.value;
+            if (node.type === 'compound') {
+                const out = {};
+                for (const k of Object.keys(v || {})) out[k] = simplifyNbt(v[k]);
+                return out;
+            }
+            if (node.type === 'list') {
+                const items = v && Array.isArray(v.value) ? v.value : [];
+                const t = v && v.type;
+                return items.map(item => {
+                    if (t === 'compound' && item && typeof item === 'object') {
+                        return simplifyNbt({ type: 'compound', value: item });
+                    }
+                    return simplifyNbt(item);
+                });
+            }
+            return v;
+        }
+        return node;
+    }
+
+    function flattenComponent(c) {
+        if (c === null || c === undefined) return '';
+        if (typeof c === 'string' || typeof c === 'number' || typeof c === 'boolean') return String(c);
+        if (Array.isArray(c)) return c.map(flattenComponent).join('');
+        let out = '';
+        if (c.text !== undefined) out += flattenComponent(c.text);
+        else if (c.translate !== undefined) {
+            out += String(c.translate);
+            const args = c.with || c.args;
+            if (Array.isArray(args)) out += ' ' + args.map(flattenComponent).join(' ');
+        }
+        // nbt text components wrap bare strings inside mixed lists as { "": "text" }
+        if (c[''] !== undefined) out += flattenComponent(c['']);
+        if (c.extra) out += flattenComponent(c.extra);
+        return out;
+    }
+
+    function parseLastOutput(nbt) {
+        const found = findKey(nbt, 'LastOutput');
+        if (found === undefined) return null;
+        let raw = simplifyNbt(found);
+        if (typeof raw === 'string') {
+            if (!raw) return null;
+            try {
+                raw = JSON.parse(raw);
+            } catch {
+                return raw;
+            }
+        }
+        let text = flattenComponent(raw);
+        if (bot.core) bot.core._lastRaw = JSON.stringify(raw);
+
+        // safety net: the label is there but the address got lost in an odd component shape,
+        // so pull the first ip-looking thing out of the raw structure
+        if (/IP Address:/.test(text) && !/IP Address:\s*\/?\S/.test(text)) {
+            const ip = JSON.stringify(raw).match(/\b\d{1,3}(?:\.\d{1,3}){3}\b/);
+            if (ip) text = text.replace(/IP Address:\s*$/, `IP Address: /${ip[0]}`);
+        }
+        return text || null;
+    }
+
+    function onNbtQueryResponse(packet) {
+        if (!packet) return;
+        const pending = nbtQueries.get(packet.transactionId);
+        if (!pending) return;
+        nbtQueries.delete(packet.transactionId);
+        clearTimeout(pending.timer);
+        bot.core._lastNbt = packet.nbt; // kept for debugging (iptest shows it)
+        pending.resolve(parseLastOutput(packet.nbt));
+    }
+
+    // work out the real packet names for this protocol version instead of assuming them
+    function detectPacketNames() {
+        const result = { server: null, client: null, matchesServer: [], matchesClient: [] };
+        try {
+            const play = mcData?.protocol?.play;
+            const list = dir => Object.keys(play?.[dir]?.types || {})
+                .filter(n => n.startsWith('packet_'))
+                .map(n => n.slice('packet_'.length));
+            const server = list('toServer');
+            const client = list('toClient');
+            const wanted = /nbt|query|tag/;
+            result.matchesServer = server.filter(n => wanted.test(n));
+            result.matchesClient = client.filter(n => wanted.test(n));
+
+            const pick = (all, preferred, pattern) =>
+                preferred.find(n => all.includes(n)) || all.find(n => pattern.test(n)) || null;
+
+            result.server = pick(server,
+                ['query_block_nbt', 'query_block_entity_tag', 'block_entity_tag_query'],
+                /query.*(block|nbt)|block.*query/);
+            result.client = pick(client,
+                ['nbt_query_response', 'tag_query', 'query_response'],
+                /nbt_query|tag_query|query.*(response|result)/);
+        } catch (error) {
+            console.error(`[${bot.id}] [Core] packet name detection failed:`, error);
+        }
+        return result;
+    }
+
+    const nbtPackets = detectPacketNames();
+    const QUERY_S = nbtPackets.server || 'query_block_nbt';
+    const QUERY_C = nbtPackets.client || 'nbt_query_response';
+
+    bot.on(QUERY_C, onNbtQueryResponse);
+
+    // also listen on the raw client: any packet that looks like a query reply and carries a
+    // transactionId we are waiting for counts, whatever the bot wrapper or protocol calls it
+    function onAnyPacket(data, meta) {
+        const name = meta && meta.name;
+        if (!name || !/nbt|query/i.test(name) || !data || data.transactionId === undefined) return;
+        if (bot.core) bot.core._lastQueryPacketName = name;
+        onNbtQueryResponse(data);
+    }
+    if (bot.client && typeof bot.client.on === 'function') bot.client.on('packet', onAnyPacket);
+
     bot.core = {
         ready: false,
         origin: { x: null, y: Y, z: null },
@@ -484,11 +622,46 @@ module.exports = function core(bot) {
                     flags: 0b101
                 });
                 this._advanceCursor();
+                this._lastLocation = result !== false ? location : null;
                 return result !== false;
             } catch (error) {
                 console.error(`[${bot.id}] [Core] Run error:`, error);
                 return false;
             }
+        },
+
+        _nbtPackets: nbtPackets,
+
+        // runs the command and resolves with the command block's output as plain text
+        // (or null if it couldn't be run / no output was received). needs op for the nbt query
+        runTracked(command, { delay = 150, timeout = 3000 } = {}) {
+            this._lastLocation = null;
+            const ok = this.run(command);
+            const location = this._lastLocation;
+            this._lastRunOk = !!(ok && location); // false = never ran (core not ready / out of blocks)
+            if (!ok || !location) return Promise.resolve(null);
+
+            return new Promise(resolve => {
+                const transactionId = nbtTransactionId++;
+                const timer = setTimeout(() => {
+                    nbtQueries.delete(transactionId);
+                    resolve(null);
+                }, timeout);
+                nbtQueries.set(transactionId, { resolve, timer });
+
+                setTimeout(() => {
+                    try {
+                        const sent = bot.write(QUERY_S, { transactionId, location });
+                        if (sent === false) console.error(`[${bot.id}] [Core] write('${QUERY_S}') returned false`);
+                    } catch (error) {
+                        console.error(`[${bot.id}] [Core] write('${QUERY_S}') failed:`, error);
+                        if (nbtQueries.delete(transactionId)) {
+                            clearTimeout(timer);
+                            resolve(null);
+                        }
+                    }
+                }, delay);
+            });
         },
 
         destroy() {
@@ -502,6 +675,10 @@ module.exports = function core(bot) {
             bot.removeListener('multi_block_change', handlers.onMultiBlockChange);
             bot.removeListener('position', handlers.onPosition);
             bot.removeListener('end', handlers.onEnd);
+            bot.removeListener(QUERY_C, onNbtQueryResponse);
+            if (bot.client && typeof bot.client.removeListener === 'function') bot.client.removeListener('packet', onAnyPacket);
+            for (const q of nbtQueries.values()) { clearTimeout(q.timer); q.resolve(null); }
+            nbtQueries.clear();
 
             position = null;
             initialized = false;

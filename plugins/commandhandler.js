@@ -29,7 +29,7 @@ function getUUID(name) {
         const uuid = bot.playersAPI.getUUID(name);
         if (uuid) return uuid;
     }
-    const offline = computeOfflineUUID?.(name)
+    const offline = bot.playersAPI?.offlineUUID?.(name);
     if (offline) return offline;
     console.warn(`[CommandHandler] Cannot get UUID for ${name}`);
     return null;
@@ -53,6 +53,16 @@ function getLevel(uuid) {
     if (!uuid) return LVL.PUBLIC;
     const lvl = userLevels.get(uuid) ?? LVL.PUBLIC;
     return lvl;
+}
+
+function configuredLevel(name) {
+    const authList = bot.globalConfig?.bot?.authList || {};
+    const clean = String(name || '').toLowerCase();
+    const admins = Array.isArray(authList.admin) ? authList.admin : [];
+    const trusted = Array.isArray(authList.trusted) ? authList.trusted : [];
+    if (admins.some(value => String(value).toLowerCase() === clean)) return LVL.ADMIN;
+    if (trusted.some(value => String(value).toLowerCase() === clean)) return LVL.TRUSTED;
+    return LVL.PUBLIC;
 }
 
     function extractPlayer(msg) {
@@ -176,9 +186,12 @@ async function exec(cmdName, args, raw, msg, player) {
     }
 
     const name = player.username;
-    let uuid = null;
-    const chatBind = bot.chatSenderUUIDs?.get(name.toLowerCase());
-    if (chatBind && (Date.now() - chatBind.ts < 15000)) {
+    const isConsole = player.isConsole === true;
+    let uuid = isConsole ? 'console' : null;
+    const chatBind = isConsole ? null : bot.chatSenderUUIDs?.get(name.toLowerCase());
+    if (isConsole) {
+        // Console execution is already an authenticated local admin source.
+    } else if (chatBind && (Date.now() - chatBind.ts < 15000)) {
         uuid = chatBind.uuid;
 if (!uuid) {
     console.error(`[CommandHandler] No UUID for ${name}`);
@@ -192,7 +205,11 @@ if (!uuid) {
 }
     }
     player.uuid = uuid;
-const currentLevel = bot.commands.getPlayerLevel(uuid) || 0;
+    const configured = isConsole ? LVL.ADMIN : configuredLevel(name);
+    const currentLevel = isConsole
+        ? LVL.ADMIN
+        : Math.max(bot.commands.getPlayerLevel(uuid) || 0, configured);
+    if (!isConsole && configured > 0) userLevels.set(uuid, configured);
     if (cmd.level > currentLevel) {
         tellrawCmd("Authenticate to use this command")
         return;
@@ -211,6 +228,7 @@ const currentLevel = bot.commands.getPlayerLevel(uuid) || 0;
         message: msg,
         prefix: player.usedPrefix || prefixes[0] || 'nr:',
         level: currentLevel,
+        source: isConsole ? 'console' : 'chat',
         levels: LVL,
         commands: registry,
         commandsDir: cmdsDir,
@@ -224,7 +242,12 @@ const currentLevel = bot.commands.getPlayerLevel(uuid) || 0;
             const json = typeof text === 'string' ? JSON.stringify({ text }) : JSON.stringify(text);
             return bot.core.run(`tellraw ${target} ${json}`);
         },
-        tellrawCommand: tellrawCmd
+        tellrawCommand: isConsole
+            ? (text) => {
+                console.log(`[${bot.id}] [Console] ${text}`);
+                return true;
+            }
+            : tellrawCmd
     };
 
     try {
@@ -266,22 +289,88 @@ const currentLevel = bot.commands.getPlayerLevel(uuid) || 0;
         setPlayerLevel: (uuid, level) => setLevel(uuid, level),
         removePlayer: (uuid) => removeLevel(uuid),
         getPlayerUUID: getUUID,
-        reload(name) {
-            if (name) {
-                const norm = String(name).toLowerCase();
-                const old = registry.get(norm);
-                if (old) {
-                    registry.forEach((v, k) => {
-                        if (v === old) registry.delete(k);
-                    });
-                }
-                loadCmd(`${norm}.js`);
-                return;
-            }
-            registry.clear();
-            loadAll();
-        },
-        execute: exec
+		reload(name) {
+			const reloadFile = (file) => {
+				const fullPath = path.join(cmdsDir, file);
+
+				if (!fs.existsSync(fullPath) || !file.endsWith('.js')) {
+					return false;
+				}
+
+				try {
+					const resolved = require.resolve(fullPath);
+					delete require.cache[resolved];
+
+					const cmd = require(fullPath);
+
+					if (!cmd || typeof cmd.execute !== 'function') {
+						console.error(`[${bot.id}] Invalid command: ${file}`);
+						return false;
+					}
+
+					const info = {
+						name: String(cmd.name || path.basename(file, '.js')).toLowerCase(),
+						description: String(cmd.description || 'No description'),
+						level: Number.isInteger(cmd.level) ? cmd.level : LVL.PUBLIC,
+						aliases: Array.isArray(cmd.aliases)
+							? cmd.aliases.map(x => String(x).toLowerCase())
+							: [],
+						execute: cmd.execute,
+						file
+					};
+
+					registry.set(info.name, info);
+
+					for (const alias of info.aliases) {
+						registry.set(alias, info);
+					}
+
+					return true;
+				} catch (e) {
+					console.error(`[${bot.id}] Failed to load ${file}:`, e);
+					return false;
+				}
+			};
+
+			if (name) {
+				const norm = String(name).toLowerCase();
+				const old = registry.get(norm);
+				const file = old?.file || `${norm}.js`;
+
+				if (old) {
+					registry.forEach((v, k) => {
+						if (v === old) registry.delete(k);
+					});
+				}
+
+				return reloadFile(file);
+			}
+
+			registry.clear();
+
+			if (!fs.existsSync(cmdsDir)) {
+				fs.mkdirSync(cmdsDir, { recursive: true });
+				return;
+			}
+
+			const files = fs.readdirSync(cmdsDir).filter(f => f.endsWith('.js'));
+
+			for (const file of files) {
+				reloadFile(file);
+			}
+		},
+        execute: exec,
+        executeConsole(commandName, args = []) {
+            const name = String(commandName || '').replace(/^\.+/, '').replace(/^nr:/i, '');
+            if (!name) return false;
+            const list = Array.isArray(args) ? args.map(String) : String(args).trim().split(/\s+/).filter(Boolean);
+            return exec(name, list, [name, ...list].join(' '), `[console] ${name}`, {
+                username: 'Console',
+                uuid: 'console',
+                usedPrefix: '',
+                isConsole: true
+            });
+        }
     };
 
     loadAll();

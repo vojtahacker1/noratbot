@@ -1,0 +1,62 @@
+{
+    "players": {
+        "4f073a3a-9d49-3297-b5c2-4c64d7215974": {
+            "username": "norat_bot",
+            "lastSeenTime": 1794154439065,
+            "lastSeenServer": "chipmunk"
+        },
+        "dce36625-4319-3c76-bac5-0120594409a3": {
+            "username": "kono_b",
+            "lastSeenTime": 1794154439377,
+            "lastSeenServer": "chipmunk"
+        },
+        "7bbc5475-d55e-3fc7-b35b-59ec312c251d": {
+            "username": "HermitBot",
+            "lastSeenTime": 1794154439700,
+            "lastSeenServer": "chipmunk"
+        },
+        "2f1d1bb9-7337-31d7-997f-acaa527152d9": {
+            "username": "VojtaV12",
+            "lastSeenTime": 1794154440012,
+            "lastSeenServer": "chipmunk"
+        },
+        "a55612cc-17ed-3cc5-a830-c5b625c3b2a4": {
+            "username": "dfngbrth",
+            "lastSeenTime": 1794154591276,
+            "lastSeenServer": "chipmunk"
+        },
+        "c1697eeb-aecf-3aa5-8c20-fa8c0a486bcc": {
+            "username": "1rm3LyB",
+            "lastSeenTime": 1794154440635,
+            "lastSeenServer": "chipmunk"
+        },
+        "03b58e3d-b254-3d3d-9b17-f3ab7f194c0e": {
+            "username": "ydhMBNXGrQuKVip",
+            "lastSeenTime": 1794154440949,
+            "lastSeenServer": "chipmunk"
+        },
+        "96ff7591-d47a-3721-937d-94e1ae40cf97": {
+            "username": "K9jeYCQ",
+            "lastSeenTime": 1794154441258,
+            "lastSeenServer": "chipmunk"
+        },
+        "b0700679-2302-3676-abe4-e36c5088649c": {
+            "username": "xs4puyEDzm",
+            "lastSeenTime": 1794154441570,
+            "lastSeenServer": "chipmunk"
+        }
+    },
+    "ips": {
+        "chipmunk": {
+            "4f073a3a-9d49-3297-b5c2-4c64d7215974": "10.131.143.117",
+            "dce36625-4319-3c76-bac5-0120594409a3": "10.131.254.233",
+            "7bbc5475-d55e-3fc7-b35b-59ec312c251d": "10.131.145.85",
+            "2f1d1bb9-7337-31d7-997f-acaa527152d9": "10.131.143.117",
+            "a55612cc-17ed-3cc5-a830-c5b625c3b2a4": "10.131.143.117",
+            "c1697eeb-aecf-3aa5-8c20-fa8c0a486bcc": "10.131.83.47",
+            "03b58e3d-b254-3d3d-9b17-f3ab7f194c0e": "10.131.13.219",
+            "96ff7591-d47a-3721-937d-94e1ae40cf97": "10.131.41.176",
+            "b0700679-2302-3676-abe4-e36c5088649c": "10.131.101.120"
+        }
+    }
+}

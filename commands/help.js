@@ -1,5 +1,13 @@
 const gradient = require('../utils/gradient');
 
+const PREFIX = 'nr:';
+
+const LEVELS = {
+    0: { name: 'Public', color: '#55aaff' },
+    1: { name: 'Trusted', color: '#ffaa00' },
+    2: { name: 'Admin', color: '#ff6b6b' }
+};
+
 function grad(text, start, end) {
     return gradient.gradient(text, start, end);
 }
@@ -27,96 +35,125 @@ function toSNBT(obj) {
     return "''";
 }
 
+function levelOf(cmd) {
+    return LEVELS[Number(cmd.level)] || { name: `Level ${cmd.level}`, color: '#ffffff' };
+}
+
+// commands can set `usage: 'seen <player>'`, otherwise just show the name
+function usageOf(cmd) {
+    return PREFIX + (cmd.usage || cmd.name);
+}
+
+function sendInfo(ctx, cmd) {
+    const level = levelOf(cmd);
+    const out = [];
+
+    out.push(...grad(`Command Info: ${cmd.name}`, '#f4fcff', '#238bff'));
+    out.push({ text: '\n', color: 'gray' });
+
+    out.push({ text: 'Description: ', color: '#62d66b' });
+    out.push({ text: cmd.description || 'No description', color: '#ffffff' });
+    out.push({ text: '\n', color: 'gray' });
+
+    out.push({ text: 'Usage: ', color: '#62d66b' });
+    out.push({ text: usageOf(cmd), color: '#ffffff' });
+    out.push({ text: '\n', color: 'gray' });
+
+    out.push({ text: 'Level: ', color: '#62d66b' });
+    out.push({ text: `${cmd.level} (${level.name})`, color: level.color });
+    out.push({ text: '\n', color: 'gray' });
+
+    if (cmd.aliases && cmd.aliases.length) {
+        out.push({ text: 'Aliases: ', color: '#62d66b' });
+        out.push({ text: cmd.aliases.join(', '), color: '#ffffff' });
+        out.push({ text: '\n', color: 'gray' });
+    }
+
+    const suggest = `${PREFIX}${cmd.name} `;
+    out.push({ text: '\n» ', color: 'dark_gray' });
+    out.push({
+        text: 'Click to write command',
+        color: '#55aaff',
+        click_event: { action: 'suggest_command', command: suggest },
+        hover_event: { action: 'show_text', value: { text: `Suggest ${suggest}`, color: 'green' } }
+    });
+
+    ctx.run(`tellraw @a ${toSNBT({ text: '', extra: out })}`);
+}
+
+function sendList(ctx, onlyLevel) {
+    // ctx.commands also holds aliases, so dedupe by name
+    const all = [...new Map([...ctx.commands.values()].map(c => [c.name, c])).values()]
+        .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+
+    const out = [];
+    out.push(...grad('noratbot - Commands', '#f4fcff', '#238bff'));
+    out.push({ text: '\n', color: 'gray' });
+
+    for (const lvl of Object.keys(LEVELS).map(Number)) {
+        if (onlyLevel !== undefined && lvl !== onlyLevel) continue;
+
+        const cmds = all.filter(c => Number(c.level) === lvl);
+        if (!cmds.length) continue;
+
+        out.push({ text: `\n${LEVELS[lvl].name} `, color: LEVELS[lvl].color, bold: true });
+        out.push({ text: `(${cmds.length})\n`, color: 'dark_gray' });
+
+        cmds.forEach((cmd, i) => {
+            out.push({
+                text: cmd.name,
+                color: LEVELS[lvl].color,
+                click_event: { action: 'suggest_command', command: `${PREFIX}${cmd.name} ` },
+                hover_event: {
+                    action: 'show_text',
+                    value: {
+                        text: '',
+                        extra: [
+                            { text: usageOf(cmd), color: '#ffffff' },
+                            { text: `\n${cmd.description || 'No description'}`, color: 'gray' }
+                        ]
+                    }
+                }
+            });
+            if (i < cmds.length - 1) out.push({ text: ' · ', color: 'dark_gray' });
+        });
+
+        out.push({ text: '\n', color: 'gray' });
+    }
+
+    out.push({ text: `\nHover for usage. ${PREFIX}help <command> for details`, color: 'dark_gray' });
+
+    ctx.run(`tellraw @a ${toSNBT({ text: '', extra: out })}`);
+}
+
 module.exports = {
     name: 'help',
     description: 'List all commands with levels',
+    usage: 'help [command|public|trusted|admin]',
     level: 0,
 
     async execute(ctx) {
         const args = ctx.args || [];
-        const prefix = 'nr:';
 
-        if (args.length > 0) {
-            const searchName = args[0].toLowerCase();
-            const foundCmd = ctx.commands.get(searchName);
-
-            if (!foundCmd) {
-                ctx.tellrawCommand(`Command "${searchName}" not found.`);
-                return;
-            }
-
-            const infoComponents = [];
-            infoComponents.push(...grad(`Command Info: ${foundCmd.name}`, '#f4fcff', '#238bff'));
-            infoComponents.push({ text: '\n', color: 'gray' });
-
-            infoComponents.push({ text: 'Description: ', color: '#62d66b' });
-            infoComponents.push({ text: foundCmd.description || 'No description', color: '#ffffff' });
-            infoComponents.push({ text: '\n', color: 'gray' });
-
-            let levelName = 'Public';
-            if (foundCmd.level === 1) levelName = 'Trusted';
-            else if (foundCmd.level === 2) levelName = 'Admin';
-            infoComponents.push({ text: 'Level: ', color: '#62d66b' });
-            infoComponents.push({ text: `${foundCmd.level} (${levelName})`, color: '#55aaff' });
-            infoComponents.push({ text: '\n', color: 'gray' });
-
-            if (foundCmd.aliases && foundCmd.aliases.length) {
-                infoComponents.push({ text: 'Aliases: ', color: '#62d66b' });
-                infoComponents.push({ text: foundCmd.aliases.join(', '), color: '#ffffff' });
-                infoComponents.push({ text: '\n', color: 'gray' });
-            }
-
-            const runText = `${prefix}${foundCmd.name}`;
-            infoComponents.push({ text: '\n» ', color: 'dark_gray' });
-            infoComponents.push({
-                text: 'Click to write command',
-                color: '#55aaff',
-                click_event: { action: 'suggest_command', command: runText },
-                hover_event: { action: 'show_text', value: { text: `Suggest ${runText}`, color: 'green' } }
-            });
-
-            const rootInfo = { text: '', extra: infoComponents };
-            ctx.run(`tellraw @a ${toSNBT(rootInfo)}`);
+        if (args.length === 0) {
+            sendList(ctx);
             return;
         }
 
-        const all = [...new Map([...ctx.commands.values()].map(c => [c.name, c])).values()];
-        const sorted = all.sort((a, b) => {
-            if (Number(a.level) !== Number(b.level)) return Number(a.level) - Number(b.level);
-            return String(a.name).localeCompare(String(b.name));
-        });
+        const search = args[0].toLowerCase();
 
-        const components = [];
-        components.push(...grad('noratbot - Commands', '#f4fcff', '#238bff'));
-        components.push({ text: '\n\n', color: 'gray' });
-        const levelColors = {
-            0: '#55aaff',
-            1: '#ffaa00',
-            2: '#ff6b6b' 
-        };
-        const levelNames = {
-            0: 'Public',
-            1: 'Trusted',
-            2: 'Admin'
-        };
-
-        for (let i = 0; i < sorted.length; i++) {
-            const cmd = sorted[i];
-            const cmdText = `${prefix}${cmd.name}`;
-            const color = levelColors[cmd.level] || '#ffffff';
-
-            components.push({
-                text: cmd.name,
-                color: color,
-                click_event: { action: 'suggest_command', command: cmdText }
-            });
-
-            if (i < sorted.length - 1) {
-                components.push({ text: ' ', color: 'gray' });
-            }
+        const cmd = ctx.commands.get(search);
+        if (cmd) {
+            sendInfo(ctx, cmd);
+            return;
         }
 
-        const rootObject = { text: '', extra: components };
-        ctx.run(`tellraw @a ${toSNBT(rootObject)}`);
+        const level = Object.keys(LEVELS).find(n => LEVELS[n].name.toLowerCase() === search);
+        if (level !== undefined) {
+            sendList(ctx, Number(level));
+            return;
+        }
+
+        ctx.tellrawCommand(`Command "${search}" not found.`);
     }
 };

@@ -1,3 +1,21 @@
+// Launcher: a plain `node index.js` only supervises a child copy of this file.
+// Exit code 42 (nr:restart force) starts it again, any other exit code ends it.
+if (!process.env.NR_LAUNCHER) {
+    const { spawn } = require('child_process');
+    const run = () => {
+        const child = spawn(process.execPath, [...process.execArgv, __filename, ...process.argv.slice(2)], {
+            stdio: 'inherit',
+            env: { ...process.env, NR_LAUNCHER: '1' }
+        });
+        child.on('exit', code => {
+            if (code === 42) setTimeout(run, 1000);
+            else process.exit(code ?? 0);
+        });
+    };
+    run();
+    return;
+}
+
 const fs = require('fs');
 const path = require('path');
 const BotManager = require('./core/botmanager');
