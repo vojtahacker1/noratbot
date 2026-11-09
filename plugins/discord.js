@@ -1,25 +1,23 @@
+'use strict';
 
 const {
     Client,
     GatewayIntentBits,
     Partials,
-    ChannelType,
-    EmbedBuilder
+    EmbedBuilder,
+    ApplicationCommandOptionType,
+    MessageFlags
 } = require('discord.js');
 
 const fs = require('fs');
 const path = require('path');
 
-if (!global.discordClient) global.discordClient = null;
-if (!global.clientReady) global.clientReady = false;
-if (!global.channelMap) global.channelMap = new Map();
-if (!global.discordCommands) global.discordCommands = new Map();
-if (!global.commandPrefix) global.commandPrefix = '!';
-if (!global.processedMessages) global.processedMessages = new Set();
+const CMD_DIR = path.join(process.cwd(), 'discordcommands');
 
-const cmdDir = path.join(process.cwd(), 'discordcommands');
+const LEVELS = Object.freeze({ PUBLIC: 0, TRUSTED: 1, ADMIN: 2 });
+const RANK_NAMES = Object.freeze(['PUBLIC', 'TRUSTED', 'ADMIN']);
 
-const COLORS = {
+const COLORS = Object.freeze({
     default: 0x5865F2,
     public: 0x5865F2,
     trusted: 0x57F287,
@@ -27,153 +25,299 @@ const COLORS = {
     success: 0x57F287,
     error: 0xED4245,
     warning: 0xFEE75C
+});
+
+const FOOTER = 'noratbot • Discord';
+const COMMAND_PREFIX = '!';
+
+const RELAY = Object.freeze({
+    interval: 900,
+    maxBuffer: 50,
+    limit: 1900,
+    maxRetries: 3
+});
+
+// Shared state. discordcommands/*.js read the global maps, so they stay
+// authoritative instead of being copied into each command module.
+if (!global.discordClient) global.discordClient = null;
+if (!global.clientReady) global.clientReady = false;
+if (!global.channelMap) global.channelMap = new Map();
+if (!global.discordBots) global.discordBots = new Map();
+if (!global.discordCommands) global.discordCommands = new Map();
+if (!global.commandPrefix) global.commandPrefix = COMMAND_PREFIX;
+if (!global.processedMessages) global.processedMessages = new Set();
+
+const bridge = {
+    client: null,
+    config: null,
+    prefix: COMMAND_PREFIX,
+    relays: new Map(),
+    slashRegistered: false,
+    loginAttempts: 0,
+    retryTimer: null
 };
+
+function log(...args) {
+    console.log('[Discord]', ...args);
+}
+
+function warn(...args) {
+    console.warn('[Discord]', ...args);
+}
+
+function fail(...args) {
+    console.error('[Discord]', ...args);
+}
+
+function clampLevel(value) {
+    return Math.min(LEVELS.ADMIN, Math.max(LEVELS.PUBLIC, value));
+}
+
+function truncate(value, limit) {
+    const text = String(value ?? '');
+    return text.length > limit ? text.slice(0, limit - 1) + '…' : text;
+}
 
 function createEmbed(description, options = {}) {
     const embed = new EmbedBuilder()
         .setColor(options.color ?? COLORS.default)
         .setTimestamp();
 
-    if (options.title) {
-        embed.setTitle(String(options.title).slice(0, 256));
-    }
-
-    if (description) {
-        embed.setDescription(String(description).slice(0, 4096));
-    }
-
-    if (options.footer) {
-        embed.setFooter({
-            text: String(options.footer).slice(0, 2048)
-        });
-    }
+    if (options.title) embed.setTitle(truncate(options.title, 256));
+    if (description) embed.setDescription(truncate(description, 4096));
+    if (options.footer) embed.setFooter({ text: truncate(options.footer, 2048) });
 
     return embed;
 }
 
 function splitText(text, limit = 3900) {
-    text = String(text ?? '');
-    if (!text) return [];
+    const value = String(text ?? '');
+    if (!value) return [];
 
-    const result = [];
+    const chunks = [];
+    let rest = value;
 
-    while (text.length > limit) {
-        let cut = text.lastIndexOf('\n', limit);
+    while (rest.length > limit) {
+        let cut = rest.lastIndexOf('\n', limit);
 
-        if (cut < limit * 0.5) {
-            cut = text.lastIndexOf(' ', limit);
-        }
-
+        if (cut < limit * 0.5) cut = rest.lastIndexOf(' ', limit);
         if (cut < limit * 0.5) cut = limit;
 
-        result.push(text.slice(0, cut));
-        text = text.slice(cut).replace(/^\n+/, '');
+        chunks.push(rest.slice(0, cut));
+        rest = rest.slice(cut).replace(/^\n+/, '');
     }
 
-    if (text) result.push(text);
-
-    return result;
+    if (rest) chunks.push(rest);
+    return chunks;
 }
 
-async function sendEmbed(channel, description, options = {}) {
-    if (!channel || !channel.isTextBased()) return;
-
-    const chunks = splitText(description);
-
-    for (let i = 0; i < chunks.length; i++) {
-        await channel.send({
-            embeds: [
-                createEmbed(chunks[i], {
-                    ...options,
-                    title: i === 0 ? options.title : undefined
-                })
-            ],
-            allowedMentions: {
-                parse: [],
-                repliedUser: false
-            }
-        });
+class Responder {
+    constructor(target) {
+        this.target = target;
+        this.sent = false;
     }
-}
 
-async function sendCommandOutput(msg, output, options = {}) {
-    if (output == null || output === '') return;
+    get isInteraction() {
+        return typeof this.target?.isChatInputCommand === 'function';
+    }
 
-    if (output instanceof EmbedBuilder) {
-        if (output.data.color == null) {
-            output.setColor(options.color ?? COLORS.default);
+    async send(payload) {
+        if (!this.target) return null;
+
+        if (!this.isInteraction) return this.target.reply(payload);
+
+        if (this.sent) return this.target.followUp(payload);
+
+        this.sent = true;
+
+        if (!this.target.deferred && !this.target.replied) {
+            return this.target.reply(payload);
         }
 
-        await msg.reply({
-            embeds: [output],
-            allowedMentions: {
-                parse: [],
-                repliedUser: false
-            }
-        });
+        return this.target.editReply(payload);
+    }
+}
 
-        return;
+function mentionSafe() {
+    return { parse: [], repliedUser: false };
+}
+
+async function sendEmbeds(responder, embeds) {
+    if (!embeds.length) return;
+
+    // Discord allows ten embeds per message.
+    for (let i = 0; i < embeds.length; i += 10) {
+        await responder.send({
+            embeds: embeds.slice(i, i + 10),
+            allowedMentions: mentionSafe()
+        });
+    }
+}
+
+async function sendOutput(target, output, options = {}) {
+    if (output == null) return;
+
+    const responder = target instanceof Responder ? target : new Responder(target);
+
+    if (output instanceof EmbedBuilder) {
+        return sendEmbeds(responder, [output]);
     }
 
     if (output?.embed instanceof EmbedBuilder) {
-        await sendCommandOutput(msg, output.embed, options);
+        return sendEmbeds(responder, [output.embed]);
+    }
+
+    if (Array.isArray(output)) {
+        for (const item of output) await sendOutput(responder, item, options);
         return;
     }
 
-    if (typeof output === 'object' && output.description) {
-        await msg.reply({
-            embeds: [
-                createEmbed(output.description, {
-                    title: output.title,
-                    color: output.color ?? options.color ?? COLORS.default,
-                    footer: options.footer
-                })
-            ],
-            allowedMentions: {
-                parse: [],
-                repliedUser: false
-            }
-        });
-
-        return;
-    }
-
-    await msg.reply({
-        embeds: [
-            createEmbed(String(output), {
-                title: options.title ?? 'Command response',
-                color: options.color ?? COLORS.default,
-                footer: options.footer ?? 'noratbot • Discord'
+    if (typeof output === 'object' && typeof output.description === 'string') {
+        return sendEmbeds(responder, [
+            createEmbed(output.description, {
+                title: output.title,
+                color: output.color ?? options.color,
+                footer: output.footer ?? options.footer
             })
-        ],
-        allowedMentions: {
-            parse: [],
-            repliedUser: false
-        }
-    });
+        ]);
+    }
+
+    const text = String(output);
+    if (!text.trim()) return;
+
+    const chunks = splitText(text);
+    const embeds = chunks.map((chunk, index) =>
+        createEmbed(chunk, {
+            title: index === 0 ? options.title : undefined,
+            color: options.color,
+            footer: options.footer
+        })
+    );
+
+    return sendEmbeds(responder, embeds);
 }
 
-async function waitCore(bot, timeout = 10000) {
-    if (bot.core && typeof bot.core.run === 'function') {
-        return true;
+function hasRole(member, id) {
+    if (!id || !member) return false;
+
+    const roles = member.roles;
+
+    if (Array.isArray(roles)) return roles.includes(String(id));
+    return Boolean(roles?.cache?.has(String(id)));
+}
+
+function rankOf(member, dconf) {
+    if (hasRole(member, dconf?.adminId)) return 'ADMIN';
+    if (hasRole(member, dconf?.trustedId)) return 'TRUSTED';
+    return 'PUBLIC';
+}
+
+function levelOf(rank) {
+    return LEVELS[rank] ?? LEVELS.PUBLIC;
+}
+
+function requiredLevel(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return clampLevel(Math.trunc(value));
     }
 
-    return new Promise(resolve => {
-        const start = Date.now();
+    const key = String(value ?? '').trim().toUpperCase();
 
-        const iv = setInterval(() => {
-            if (bot.core && typeof bot.core.run === 'function') {
-                clearInterval(iv);
+    if (Object.prototype.hasOwnProperty.call(LEVELS, key)) return LEVELS[key];
+
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? clampLevel(Math.trunc(numeric)) : LEVELS.PUBLIC;
+}
+
+function rankName(level) {
+    return RANK_NAMES[clampLevel(level)] || 'PUBLIC';
+}
+
+function rankColor(rank) {
+    if (rank === 'ADMIN') return COLORS.admin;
+    if (rank === 'TRUSTED') return COLORS.trusted;
+    return COLORS.public;
+}
+
+function commandLevel(cmd) {
+    return requiredLevel(cmd?.roleRequired);
+}
+
+async function sendPermissionDenied(responder, rank, required, ephemeral = false) {
+    const embed = createEmbed(
+        `Your rank: **${rank}**\nRequired rank: **${rankName(required)}**`,
+        { title: 'Permission denied', color: COLORS.error }
+    );
+
+    if (ephemeral && responder?.isInteraction) {
+        return responder.target.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+    }
+
+    return responder.send({ embeds: [embed], allowedMentions: mentionSafe() });
+}
+
+function bots() {
+    return [...new Set(global.discordBots.values())];
+}
+
+function getBot(id) {
+    const key = String(id ?? '').trim().toLowerCase();
+    if (!key) return null;
+
+    return global.discordBots.get(key) ||
+        bots().find(bot => String(bot.id).toLowerCase() === key) ||
+        null;
+}
+
+function linkedBot(channelId) {
+    return global.channelMap.get(String(channelId ?? '')) || null;
+}
+
+function defaultBot(channelId) {
+    const linked = linkedBot(channelId);
+    if (linked) return linked;
+
+    const list = bots();
+    return list.length === 1 ? list[0] : null;
+}
+
+function serverList() {
+    return bots().map(bot => `\`${bot.id}\``).join(', ');
+}
+
+function waitForCore(bot, timeout = 5000) {
+    if (typeof bot?.core?.run === 'function') return Promise.resolve(true);
+
+    return new Promise(resolve => {
+        const started = Date.now();
+        const timer = setInterval(() => {
+            if (typeof bot?.core?.run === 'function') {
+                clearInterval(timer);
                 resolve(true);
-            } else if (Date.now() - start >= timeout) {
-                clearInterval(iv);
+            } else if (Date.now() - started >= timeout) {
+                clearInterval(timer);
                 resolve(false);
             }
         }, 100);
+
+        timer.unref?.();
     });
 }
 
+function runCore(bot, command) {
+    if (typeof bot?.core?.run !== 'function') return false;
+
+    try {
+        return bot.core.run(command) !== false;
+    } catch (error) {
+        fail(`[${bot.id}] core command failed:`, error);
+        return false;
+    }
+}
+
 function toSNBT(obj) {
+    if (obj == null) return "''";
+
     if (typeof obj === 'string') {
         return "'" + obj
             .replace(/\\/g, '\\\\')
@@ -189,7 +333,7 @@ function toSNBT(obj) {
         return `[${obj.map(toSNBT).join(',')}]`;
     }
 
-    if (typeof obj === 'object' && obj !== null) {
+    if (typeof obj === 'object') {
         const pairs = [];
 
         for (const key of Object.keys(obj)) {
@@ -206,188 +350,6 @@ function toSNBT(obj) {
     return "''";
 }
 
-async function handleMsg(bot, msg) {
-    try {
-        if (!await waitCore(bot)) return;
-
-        const atts = [];
-
-        for (const [, att] of msg.attachments) {
-            let type = 'file';
-
-            if (att.contentType?.startsWith('image/')) type = 'image';
-            else if (att.contentType?.startsWith('video/')) type = 'video';
-            else if (att.contentType?.startsWith('audio/')) type = 'audio';
-
-            atts.push({
-                name: att.name || 'file',
-                url: att.url,
-                type
-            });
-        }
-
-        const full = (msg.content || '')
-            .replace(/@everyone/gi, '@ everyone')
-            .replace(/@here/gi, '@ here')
-            .replace(/&/g, '&amp;')
-            .replace(/§/g, '');
-
-        const author = msg.member?.displayName || msg.author.username;
-
-        let reply = '';
-        let replyTargetName = '';
-
-        if (msg.reference?.messageId) {
-            try {
-                const replied = await msg.channel.messages.fetch(
-                    msg.reference.messageId
-                );
-
-                if (replied && !replied.author.bot) {
-                    replyTargetName =
-                        replied.member?.displayName ||
-                        replied.author.username;
-
-                    reply = ` (reply @${replyTargetName})`;
-                }
-            } catch {}
-        }
-
-        const attText = atts.length
-            ? ' ' + atts.map(a => `[${a.type}: ${a.name}]`).join(' ')
-            : '';
-
-        let msgBody = reply
-            ? `${reply}: ${full}`
-            : `: ${full}`;
-
-        msgBody += attText;
-
-        if (msgBody.length > 500) {
-            msgBody = msgBody.slice(0, 497) + '...';
-        }
-
-        const link = bot.globalConfig?.discord?.link ||
-            'https://discord.gg';
-
-        const extra = [
-            {
-                text: '[noratbot Discord] ',
-                color: '#55aaff',
-                click_event: {
-                    action: 'copy_to_clipboard',
-                    value: link
-                },
-                hover_event: {
-                    action: 'show_text',
-                    value: {
-                        text: `noratbot Discord\n\nLink: ${link}`,
-                        color: 'aqua'
-                    }
-                }
-            },
-            {
-                text: author,
-                color: '#62d66b',
-                click_event: {
-                    action: 'copy_to_clipboard',
-                    value: author
-                },
-                hover_event: {
-                    action: 'show_text',
-                    value: {
-                        text:
-                            `Discord User Profile\n\n` +
-                            `Tag: ${msg.author.tag || msg.author.username}\n` +
-                            `ID: ${msg.author.id}` +
-                            (replyTargetName
-                                ? `\nReplying to: ${replyTargetName}`
-                                : ''),
-                        color: 'green'
-                    }
-                }
-            }
-        ];
-
-        if (msgBody) {
-            let textToCopy = full + attText;
-
-            if (textToCopy.length > 1000) {
-                textToCopy = textToCopy.slice(0, 997) + '...';
-            }
-
-            extra.push({
-                text: msgBody,
-                color: '#d4d4d4',
-                click_event: {
-                    action: 'copy_to_clipboard',
-                    value: textToCopy
-                },
-                hover_event: {
-                    action: 'show_text',
-                    value: {
-                        text:
-                            `Message Info\n` +
-                            `Length: ${textToCopy.length} chars\n\n` +
-                            'Click to copy message',
-                        color: 'gray'
-                    }
-                }
-            });
-        }
-
-        bot.core.run(`tellraw @a ${toSNBT({
-            text: '',
-            extra
-        })}`);
-
-    } catch (e) {
-        console.error(`[${bot.id}] [Discord] handleMsg error:`, e);
-    }
-}
-
-function loadCmds() {
-    global.discordCommands.clear();
-
-    if (!fs.existsSync(cmdDir)) {
-        fs.mkdirSync(cmdDir, { recursive: true });
-        return;
-    }
-
-    const files = fs.readdirSync(cmdDir).filter(f => f.endsWith('.js'));
-
-    for (const f of files) {
-        try {
-            const filePath = path.join(cmdDir, f);
-
-            delete require.cache[require.resolve(filePath)];
-
-            const cmd = require(filePath);
-
-            if (cmd && typeof cmd.execute === 'function') {
-                const name = (
-                    cmd.name || path.basename(f, '.js')
-                ).toLowerCase();
-
-                global.discordCommands.set(name, cmd);
-
-                if (Array.isArray(cmd.aliases)) {
-                    for (const alias of cmd.aliases) {
-                        if (typeof alias === 'string' && alias.trim()) {
-                            global.discordCommands.set(
-                                alias.trim().toLowerCase(),
-                                cmd
-                            );
-                        }
-                    }
-                }
-            }
-        } catch (e) {
-            console.error(`[Discord] Failed to load ${f}:`, e);
-        }
-    }
-}
-
 function parseSNBT(src) {
     let i = 0;
 
@@ -402,7 +364,6 @@ function parseSNBT(src) {
         while (i < src.length && src[i] !== q) {
             if (src[i] === '\\') {
                 i++;
-
                 if (i >= src.length) break;
 
                 out += src[i] === 'n' ? '\n' : src[i];
@@ -448,9 +409,7 @@ function parseSNBT(src) {
 
                 ws();
 
-                if (src[i++] !== ':') {
-                    throw new Error('Expected colon');
-                }
+                if (src[i++] !== ':') throw new Error('Expected colon');
 
                 o[k] = val();
                 ws();
@@ -463,9 +422,7 @@ function parseSNBT(src) {
                 }
             }
 
-            if (src[i++] !== '}') {
-                throw new Error('Unclosed compound');
-            }
+            if (src[i++] !== '}') throw new Error('Unclosed compound');
 
             return o;
         }
@@ -488,18 +445,14 @@ function parseSNBT(src) {
                 }
             }
 
-            if (src[i++] !== ']') {
-                throw new Error('Unclosed array');
-            }
+            if (src[i++] !== ']') throw new Error('Unclosed array');
 
             return a;
         }
 
-        if (c === "'" || c === '"') {
-            return str(c);
-        }
+        if (c === "'" || c === '"') return str(c);
 
-        const m = /^[^,\]} \t\r\n]+/.exec(src.slice(i));
+        const m = /^[^,\]}\s]+/.exec(src.slice(i));
 
         if (!m) throw new Error('Invalid SNBT value');
 
@@ -508,272 +461,752 @@ function parseSNBT(src) {
         if (m[0] === 'true') return true;
         if (m[0] === 'false') return false;
 
-        return isNaN(Number(m[0])) ? m[0] : Number(m[0]);
+        return Number.isNaN(Number(m[0])) ? m[0] : Number(m[0]);
     }
 
     const result = val();
     ws();
 
-    if (i !== src.length) {
-        throw new Error('Unexpected trailing SNBT');
-    }
+    if (i !== src.length) throw new Error('Unexpected trailing SNBT');
 
     return result;
 }
 
-function plainText(x) {
-    if (x == null) return '';
+function plainText(component) {
+    if (component == null) return '';
 
-    if (typeof x === 'string') return x;
+    if (typeof component === 'string') return component;
+    if (typeof component === 'number' || typeof component === 'boolean') return String(component);
+    if (Array.isArray(component)) return component.map(plainText).join('');
 
-    if (typeof x === 'number' || typeof x === 'boolean') {
-        return String(x);
+    let text = typeof component.text === 'string' ? component.text : '';
+
+    if (!text && component.translate) text = `[${component.translate}]`;
+
+    if (Array.isArray(component.with)) {
+        text += ' ' + component.with.map(plainText).join(', ');
     }
 
-    if (Array.isArray(x)) {
-        return x.map(plainText).join('');
-    }
+    if (component.extra) text += plainText(component.extra);
 
-    let t = typeof x.text === 'string' ? x.text : '';
-
-    if (!t && x.translate) {
-        t = `[${x.translate}]`;
-    }
-
-    if (x.with && Array.isArray(x.with)) {
-        t += ' ' + x.with.map(plainText).join(', ');
-    }
-
-    if (x.extra) {
-        t += plainText(x.extra);
-    }
-
-    return t;
+    return text;
 }
 
-function toPlain(x) {
-    if (typeof x !== 'string') {
-        return plainText(x).replace(/§[0-9a-fk-or]/gi, '');
+function toPlain(value) {
+    return plainText(value).replace(/§[0-9a-fk-or]/gi, '');
+}
+
+function loadCommands() {
+    global.discordCommands.clear();
+
+    if (!fs.existsSync(CMD_DIR)) {
+        fs.mkdirSync(CMD_DIR, { recursive: true });
+        return;
     }
 
-    return x.replace(/§[0-9a-fk-or]/gi, '');
-}
+    const files = fs.readdirSync(CMD_DIR).filter(file => file.endsWith('.js')).sort();
 
-function getRankColor(level) {
-    if (level >= 2) return COLORS.admin;
-    if (level >= 1) return COLORS.trusted;
-    return COLORS.public;
-}
-
-async function handleCommand(client, msg) {
-    const args = msg.content
-        .slice(global.commandPrefix.length)
-        .trim()
-        .split(/\s+/);
-
-    const name = args.shift()?.toLowerCase();
-
-    if (!name) return false;
-
-    const bot = global.channelMap.get(msg.channel.id);
-    const cmd = bot?.commands?.get(name);
-
-    // Discord-only commands
-    if (!cmd) {
-        const dc = global.discordCommands.get(name);
-
-        if (!dc) return false;
+    for (const file of files) {
+        const fullPath = path.join(CMD_DIR, file);
 
         try {
-            const result = await dc.execute(msg, args, client, null);
+            delete require.cache[require.resolve(fullPath)];
+            const cmd = require(fullPath);
 
-            if (result instanceof EmbedBuilder) {
-                await sendCommandOutput(msg, result);
-            } else if (result?.embed) {
-                await sendCommandOutput(msg, result.embed);
-            } else if (typeof result === 'string') {
-                await sendCommandOutput(msg, result);
+            if (!cmd || typeof cmd.execute !== 'function') {
+                warn(`Skipping ${file}: no execute() export`);
+                continue;
             }
-        } catch (e) {
-            console.error(`[Discord] Command error (${name}):`, e);
 
-            await sendCommandOutput(
-                msg,
-                'An error occurred while executing this command.',
+            const name = String(cmd.name || path.basename(file, '.js')).toLowerCase().trim();
+            if (!name) {
+                warn(`Skipping ${file}: empty command name`);
+                continue;
+            }
+
+            cmd.name = name;
+            registerCommand(name, cmd);
+
+            for (const alias of cmd.aliases || []) {
+                const key = String(alias).toLowerCase().trim();
+                if (key) registerCommand(key, cmd);
+            }
+        } catch (error) {
+            fail(`Failed to load ${file}:`, error);
+        }
+    }
+}
+
+function registerCommand(name, cmd) {
+    const existing = global.discordCommands.get(name);
+
+    if (existing && existing !== cmd) {
+        warn(`Duplicate Discord command "${name}" (${existing.name} vs ${cmd.name}); keeping the first`);
+        return;
+    }
+
+    global.discordCommands.set(name, cmd);
+}
+
+function normalizeSlashOptions(cmd) {
+    if (cmd.slash === false) return null;
+
+    if (Array.isArray(cmd.slash?.options)) {
+        return cmd.slash.options;
+    }
+
+    return [
+        {
+            type: ApplicationCommandOptionType.String,
+            name: 'input',
+            description: 'Arguments, using the same syntax as the prefix command',
+            required: false
+        }
+    ];
+}
+
+function buildSlashCommands() {
+    const definitions = [];
+    const seen = new Set();
+
+    for (const cmd of global.discordCommands.values()) {
+        if (seen.has(cmd.name)) continue;
+
+        const options = normalizeSlashOptions(cmd);
+        if (options === null) continue;
+
+        const name = cmd.name.toLowerCase().replace(/[^a-z0-9_-]/g, '-').slice(0, 32);
+        if (!name) continue;
+
+        seen.add(name);
+        definitions.push({
+            name,
+            description: truncate(cmd.description || 'No description', 100),
+            options
+        });
+    }
+
+    if (!seen.has('mc')) {
+        definitions.push({
+            name: 'mc',
+            description: 'Run a bot command on a Minecraft server',
+            options: [
                 {
-                    color: COLORS.error,
-                    title: 'Command error'
+                    type: ApplicationCommandOptionType.String,
+                    name: 'command',
+                    description: 'Command without the bot prefix',
+                    required: true
+                },
+                {
+                    type: ApplicationCommandOptionType.String,
+                    name: 'server',
+                    description: 'Server id (defaults to the linked server)',
+                    required: false
                 }
-            );
-        }
-
-        return true;
+            ]
+        });
     }
 
-    const dconf = bot.globalConfig?.discord || {};
+    return definitions;
+}
 
-    // Resolve the actual Discord member.
-    const member = msg.member ||
-        await msg.guild.members.fetch(msg.author.id).catch(() => null);
+async function registerSlashCommands() {
+    const config = bridge.config;
+    const client = bridge.client;
 
-    const roles = member?.roles?.cache;
+    if (!client?.application) return;
+    if (config.slashCommands === false) {
+        log('Slash commands disabled in config');
+        return;
+    }
+    if (bridge.slashRegistered) return;
 
-    const hasRole = id => {
-        if (!id || !roles) return false;
-        return roles.has(String(id));
-    };
+    const definitions = buildSlashCommands();
+    if (!definitions.length) return;
 
-    // ADMIN takes priority over TRUSTED.
-    const level = hasRole(dconf.adminId)
-        ? 2
-        : hasRole(dconf.trustedId)
-            ? 1
-            : 0;
-
-    const levels = {
-        PUBLIC: 0,
-        TRUSTED: 1,
-        ADMIN: 2
-    };
-
-    const rankName = level === 2
-        ? 'ADMIN'
-        : level === 1
-            ? 'TRUSTED'
-            : 'PUBLIC';
-
-    const rankColor = getRankColor(level);
-
-    function resolveRequiredLevel(value) {
-        if (typeof value === 'string') {
-            const normalized = value.toUpperCase();
-
-            if (Object.prototype.hasOwnProperty.call(levels, normalized)) {
-                return levels[normalized];
-            }
+    try {
+        if (config.guildId) {
+            await client.application.commands.set(definitions, String(config.guildId));
+        } else {
+            await client.application.commands.set(definitions);
         }
 
-        const number = Number(value);
+        bridge.slashRegistered = true;
+        log(`Registered ${definitions.length} slash command(s)${config.guildId ? ' in guild ' + config.guildId : ''}`);
+    } catch (error) {
+        fail('Failed to register slash commands:', error);
+    }
+}
 
-        return Number.isFinite(number) ? number : 0;
+function displayName(member, user) {
+    return String(
+        member?.displayName ||
+        user?.globalName ||
+        user?.username ||
+        'unknown'
+    ).replace(/§/g, '').slice(0, 80);
+}
+
+function formatMentions(message) {
+    let text = message.content || '';
+
+    for (const [id, role] of message.mentions?.roles ?? []) {
+        text = text.split(`<@&${id}>`).join(`@${role.name || 'role'}`);
     }
 
-    const requiredLevel = resolveRequiredLevel(cmd.level);
+    for (const [id, channel] of message.mentions?.channels ?? []) {
+        text = text.split(`<#${id}>`).join(`#${channel.name || 'channel'}`);
+    }
 
-    if (requiredLevel > level) {
-        const requiredName = Object.entries(levels)
-            .find(([, value]) => value === requiredLevel)?.[0] ||
-            `LEVEL ${requiredLevel}`;
+    for (const [id, user] of message.mentions?.users ?? []) {
+        const name = message.mentions.members?.get(id)?.displayName ||
+            user.globalName ||
+            user.username ||
+            'user';
 
-        await sendCommandOutput(
-            msg,
-            `Your rank: **${rankName}**\nRequired rank: **${requiredName}**`,
-            {
-                title: 'Permission denied',
-                color: COLORS.error
+        text = text
+            .split(`<@${id}>`).join(`@${name}`)
+            .split(`<@!${id}>`).join(`@${name}`);
+    }
+
+    return text.replace(/<a?:([A-Za-z0-9_~]+):\d+>/g, ':$1:');
+}
+
+function stripMarkdown(text) {
+    return String(text ?? '')
+        .replace(/```([\s\S]*?)```/g, '$1')
+        .replace(/`([^`]*)`/g, '$1')
+        .replace(/\*\*\*(.+?)\*\*\*/g, '$1')
+        .replace(/\*\*(.+?)\*\*/g, '$1')
+        .replace(/__(.+?)__/g, '$1')
+        .replace(/~~(.+?)~~/g, '$1')
+        .replace(/\|\|(.+?)\|\|/g, '$1')
+        .replace(/^\s*>\s?/gm, '')
+        .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '$1 ($2)')
+        .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '');
+}
+
+function describeMessage(message) {
+    const parts = [];
+    const text = stripMarkdown(formatMentions(message)).trim();
+
+    if (text) parts.push(text);
+
+    for (const attachment of message.attachments?.values?.() ?? []) {
+        const type = String(attachment.contentType || '');
+        const kind = type.startsWith('image/')
+            ? 'image'
+            : type.startsWith('video/')
+                ? 'video'
+                : type.startsWith('audio/')
+                    ? 'audio'
+                    : 'file';
+
+        parts.push(`[${kind}: ${attachment.name || 'attachment'}] ${attachment.url}`);
+    }
+
+    for (const sticker of message.stickers?.values?.() ?? []) {
+        parts.push(`[sticker: ${sticker.name || 'sticker'}]`);
+    }
+
+    for (const embed of message.embeds ?? []) {
+        const label = embed.title || embed.description || embed.url || 'embed';
+        parts.push(`[embed: ${stripMarkdown(label).slice(0, 200)}]`);
+    }
+
+    return parts.join('\n');
+}
+
+async function repliedTo(message) {
+    const id = message.reference?.messageId;
+    if (!id) return '';
+
+    const channel = message.channel;
+    let target = channel.messages?.cache?.get?.(id);
+
+    if (!target) {
+        target = await channel.messages?.fetch?.(id).catch(() => null);
+    }
+
+    if (!target || target.author?.bot) return '';
+
+    return displayName(target.member, target.author);
+}
+
+function relayFor(bot) {
+    return bridge.relays.get(String(bot.id).toLowerCase()) || null;
+}
+
+function noteEcho(bot, text) {
+    const relay = relayFor(bot);
+    if (!relay) return;
+
+    relay.echoes.set(text, Date.now());
+
+    if (relay.echoes.size > 25) {
+        const now = Date.now();
+
+        for (const [key, timestamp] of relay.echoes) {
+            if (now - timestamp > 15000) relay.echoes.delete(key);
+        }
+
+        if (relay.echoes.size > 50) {
+            relay.echoes.delete(relay.echoes.keys().next().value);
+        }
+    }
+}
+
+function consumeEcho(relay, text) {
+    const now = Date.now();
+
+    for (const [key, timestamp] of relay.echoes) {
+        if (now - timestamp > 15000) {
+            relay.echoes.delete(key);
+            continue;
+        }
+
+        if (text === key || text.endsWith(key)) {
+            relay.echoes.delete(key);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+async function relayDiscordMessage(bot, message) {
+    if (global.processedMessages.has(message.id)) return;
+
+    global.processedMessages.add(message.id);
+    if (global.processedMessages.size > 1000) {
+        global.processedMessages.delete(global.processedMessages.values().next().value);
+    }
+
+    if (!await waitForCore(bot)) {
+        warn(`[${bot.id}] core not ready, dropping Discord message relay`);
+        return;
+    }
+
+    const author = displayName(message.member, message.author);
+    const replyTarget = await repliedTo(message);
+    const body = describeMessage(message);
+
+    if (!body && !replyTarget) return;
+
+    let suffix = replyTarget ? ` (reply to @${replyTarget}): ${body}` : `: ${body}`;
+    if (suffix.length > 500) suffix = suffix.slice(0, 497) + '...';
+
+    const visible = `[noratbot Discord] ${author}${suffix}`;
+    noteEcho(bot, visible);
+
+    const link = bot.globalConfig?.discord?.link || 'https://discord.gg';
+
+    const extra = [
+        {
+            text: '[noratbot Discord] ',
+            color: '#55aaff',
+            click_event: { action: 'copy_to_clipboard', value: link },
+            hover_event: {
+                action: 'show_text',
+                value: {
+                    text: `noratbot Discord\n\nLink: ${link}`,
+                    color: 'aqua'
+                }
             }
+        },
+        {
+            text: author,
+            color: '#62d66b',
+            click_event: { action: 'copy_to_clipboard', value: author },
+            hover_event: {
+                action: 'show_text',
+                value: {
+                    text:
+                        'Discord User\n\n' +
+                        `Tag: ${message.author?.tag || message.author?.username || 'unknown'}\n` +
+                        `ID: ${message.author?.id || 'unknown'}` +
+                        (replyTarget ? `\nReplying to: ${replyTarget}` : ''),
+                    color: 'green'
+                }
+            }
+        },
+        {
+            text: suffix,
+            color: '#d4d4d4',
+            click_event: {
+                action: 'copy_to_clipboard',
+                value: (replyTarget ? `(reply to @${replyTarget}) ` : '') + body.slice(0, 1000)
+            },
+            hover_event: {
+                action: 'show_text',
+                value: {
+                    text: `Message\n${body.length} chars\n\nClick to copy`,
+                    color: 'gray'
+                }
+            }
+        }
+    ];
+
+    runCore(bot, `tellraw @a ${toSNBT({ text: '', extra })}`);
+}
+
+function protectFences(text) {
+    // Keep user text from closing the surrounding Discord code block.
+    return String(text).replace(/```/g, '`\u200b`\u200b`');
+}
+
+function takeBatch(lines) {
+    let content = '';
+    let consumed = 0;
+
+    for (const line of lines) {
+        const next = content ? `${content}\n${line}` : line;
+
+        if (next.length > RELAY.limit) break;
+
+        content = next;
+        consumed++;
+    }
+
+    return { content, consumed };
+}
+
+function attachRelay(bot, channelId) {
+    const key = String(bot.id).toLowerCase();
+
+    if (bridge.relays.has(key)) return;
+
+    const relay = {
+        bot,
+        channelId: String(channelId),
+        buffer: [],
+        timer: null,
+        flushing: false,
+        retries: 0,
+        echoes: new Map(),
+        stopped: false
+    };
+
+    relay.schedule = (delay = RELAY.interval) => {
+        if (relay.timer || relay.stopped) return;
+
+        relay.timer = setTimeout(() => {
+            relay.timer = null;
+            void relay.flush();
+        }, delay);
+
+        relay.timer.unref?.();
+    };
+
+    relay.enqueue = text => {
+        const value = protectFences(String(text ?? '').replace(/\u0000/g, ''));
+        if (!value.trim()) return;
+
+        for (const chunk of splitText(value, RELAY.limit)) {
+            relay.buffer.push(chunk);
+        }
+
+        while (relay.buffer.length > RELAY.maxBuffer) relay.buffer.shift();
+
+        relay.schedule();
+    };
+
+    relay.flush = async () => {
+        if (relay.flushing || !relay.buffer.length || relay.stopped) return;
+        if (!bridge.client?.isReady()) return;
+
+        relay.flushing = true;
+
+        const channel = await fetchTextChannel(relay.channelId);
+
+        if (!channel) {
+            relay.flushing = false;
+            relay.retries++;
+
+            if (relay.retries > RELAY.maxRetries) {
+                fail(`[${bot.id}] chat relay channel ${relay.channelId} is unavailable; dropping ${relay.buffer.length} message(s)`);
+                relay.buffer.length = 0;
+                relay.retries = 0;
+            } else {
+                relay.schedule(5000 * relay.retries);
+            }
+
+            return;
+        }
+
+        try {
+            while (relay.buffer.length) {
+                const { content, consumed } = takeBatch(relay.buffer);
+                if (!content || !consumed) break;
+
+                await channel.send({
+                    content: `\`\`\`\n${content}\n\`\`\``,
+                    allowedMentions: mentionSafe()
+                });
+
+                relay.buffer.splice(0, consumed);
+            }
+
+            relay.retries = 0;
+            relay.flushing = false;
+
+            if (relay.buffer.length) relay.schedule();
+        } catch (error) {
+            relay.flushing = false;
+            relay.retries++;
+
+            if (relay.retries > RELAY.maxRetries) {
+                fail(`[${bot.id}] chat relay failed ${relay.retries} time(s); dropping ${relay.buffer.length} message(s):`, error.message);
+                relay.buffer.length = 0;
+                relay.retries = 0;
+            } else {
+                warn(`[${bot.id}] chat relay send failed (attempt ${relay.retries}), retrying:`, error.message);
+                relay.schedule(2000 * relay.retries);
+            }
+        }
+    };
+
+    const onChat = text => {
+        if (consumeEcho(relay, text)) return;
+        relay.enqueue(text);
+    };
+
+    const onDisconnect = () => {
+        void relay.flush();
+    };
+
+    const onDestroy = () => {
+        if (relay.stopped) return;
+
+        // One last send so chat that arrived before shutdown is not lost.
+        void relay.flush().finally(() => relay.destroy());
+    };
+
+    relay.destroy = () => {
+        if (relay.stopped) return;
+
+        relay.stopped = true;
+
+        if (relay.timer) {
+            clearTimeout(relay.timer);
+            relay.timer = null;
+        }
+
+        bot.removeListener('chat_display', onChat);
+        bot.removeListener('bot:disconnect', onDisconnect);
+        bot.removeListener('bot:destroy', onDestroy);
+
+        bridge.relays.delete(key);
+
+        for (const [id, linked] of global.channelMap) {
+            if (linked === bot) global.channelMap.delete(id);
+        }
+    };
+
+    bot.on('chat_display', onChat);
+    bot.on('bot:disconnect', onDisconnect);
+    bot.once('bot:destroy', onDestroy);
+
+    bridge.relays.set(key, relay);
+}
+
+async function fetchTextChannel(id) {
+    const client = bridge.client;
+    if (!client?.isReady()) return null;
+
+    try {
+        const channel = client.channels.cache.get(String(id)) ||
+            await client.channels.fetch(String(id));
+
+        if (!channel?.isTextBased()) return null;
+        return channel;
+    } catch {
+        return null;
+    }
+}
+
+function flushRelays() {
+    for (const relay of bridge.relays.values()) {
+        void relay.flush();
+    }
+}
+
+function registerBot(bot) {
+    const id = String(bot.id ?? '').toLowerCase();
+    if (!id) return;
+
+    global.discordBots.set(id, bot);
+
+    const channelId = String(bot.config?.channelId ?? '').trim();
+    if (!channelId) {
+        log(`[${bot.id}] no channelId configured; commands only`);
+        return;
+    }
+
+    const existing = global.channelMap.get(channelId);
+
+    if (existing && existing !== bot) {
+        warn(`[${bot.id}] channel ${channelId} is already bridged to ${existing.id}; relay disabled for this bot`);
+        return;
+    }
+
+    global.channelMap.set(channelId, bot);
+    attachRelay(bot, channelId);
+}
+
+function buildDiscordContext(cmd, invocation) {
+    const color = rankColor(invocation.rank);
+
+    const reply = (text, options = {}) => sendOutput(invocation.responder, text, {
+        title: options.title ?? 'Command response',
+        color: options.color ?? color,
+        footer: options.footer ?? `${FOOTER} • ${invocation.rank}`
+    });
+
+    return {
+        source: invocation.source,
+        command: cmd,
+        commandName: cmd.name,
+        args: invocation.args,
+        raw: invocation.raw,
+        message: invocation.message,
+        interaction: invocation.interaction,
+        member: invocation.member,
+        user: invocation.user,
+        guild: invocation.guild,
+        channel: invocation.channel,
+        client: bridge.client,
+        bot: invocation.bot,
+        bots: bots(),
+        level: invocation.level,
+        rank: invocation.rank,
+        levels: LEVELS,
+        config: bridge.config,
+        botById: getBot,
+        reply,
+        embed: (embed, options = {}) => sendOutput(invocation.responder, embed, options),
+        run: command => runCore(invocation.bot, command)
+    };
+}
+
+async function runDiscordCommand(cmd, invocation) {
+    const required = commandLevel(cmd);
+
+    if (invocation.level < required) {
+        return sendPermissionDenied(
+            invocation.responder,
+            invocation.rank,
+            required,
+            invocation.source === 'slash'
+        );
+    }
+
+    const ctx = buildDiscordContext(cmd, invocation);
+
+    try {
+        const result = await cmd.execute(
+            invocation.message,
+            invocation.args,
+            bridge.client,
+            invocation.bot,
+            ctx
         );
 
-        return true;
-    }
-
-    const username = bot.config.username;
-    const uuid = bot.commands.getPlayerUUID(username);
-
-    if (!uuid) {
-        await sendCommandOutput(msg, 'Bot UUID unavailable.', {
-            title: 'Command error',
-            color: COLORS.error
+        await sendOutput(invocation.responder, result, {
+            title: 'Command response',
+            color: rankColor(invocation.rank),
+            footer: `${FOOTER} • ${invocation.rank}`
         });
+    } catch (error) {
+        fail(`Command "${cmd.name}" failed:`, error);
 
-        return true;
+        await sendOutput(
+            invocation.responder,
+            `An error occurred while running this command.\n\`\`\`\n${truncate(error?.message || error, 1000)}\n\`\`\``,
+            { title: 'Command error', color: COLORS.error }
+        );
     }
+}
+
+function buildMinecraftContext(cmd, invocation) {
+    const bot = invocation.bot;
+    const username = bot?.config?.username || bot?.client?.username || 'bot';
+    const uuid = bot?.commands?.getPlayerUUID?.(username) || null;
+
+    const send = (text, options = {}) => sendOutput(invocation.responder, String(text ?? ''), {
+        title: options.title ?? `${cmd.name} • ${bot?.id || 'noratbot'}`,
+        color: options.color ?? rankColor(invocation.rank),
+        footer: options.footer ?? `${FOOTER} • ${invocation.rank}`
+    });
+
+    const player = {
+        name: username,
+        username,
+        uuid,
+        minecraftName: username,
+        minecraftUUID: uuid,
+        level: invocation.level,
+        rank: invocation.rank,
+        permissionLevel: invocation.level,
+        permission: invocation.rank.toLowerCase(),
+        discordId: invocation.user?.id,
+        discordTag: invocation.user?.tag,
+        discordUsername: invocation.user?.username,
+        discordDisplayName: displayName(invocation.member, invocation.user)
+    };
 
     const commands = new Map();
 
-    for (const c of bot.commands.all()) {
-        if (!c?.name) continue;
+    for (const entry of bot?.commands?.all?.() || []) {
+        if (!entry?.name) continue;
 
-        commands.set(c.name.toLowerCase(), c);
+        commands.set(entry.name.toLowerCase(), entry);
 
-        for (const alias of c.aliases || []) {
-            if (typeof alias === 'string') {
-                commands.set(alias.toLowerCase(), c);
-            }
+        for (const alias of entry.aliases || []) {
+            if (typeof alias === 'string') commands.set(alias.toLowerCase(), entry);
         }
     }
 
-    const discordPlayer = {
-        // Keep the Minecraft identity unchanged.
-        name: username,
-        uuid,
-
-        // Discord user's permissions.
-        level,
-        rank: rankName,
-        permissionLevel: level,
-        permission: rankName.toLowerCase(),
-        role: rankName.toLowerCase(),
-
-        // Minecraft identity aliases.
-        minecraftName: username,
-        minecraftUUID: uuid,
-
-        // Discord identity.
-        discordId: msg.author.id,
-        discordTag: msg.author.tag,
-        discordUsername: msg.author.username,
-        discordDisplayName: member?.displayName || msg.author.username
-    };
-
-    const send = text => {
-        return sendCommandOutput(msg, String(text ?? ''), {
-            title: 'Command response',
-            color: rankColor,
-            footer: `noratbot • ${rankName}`
-        });
-    };
-
-    const ctx = {
+    return {
         bot,
-        bots: bot.manager?.bots || new Map(),
-
-        player: discordPlayer,
-        user: discordPlayer,
-        member,
+        bots: bot?.manager?.bots || new Map(),
+        player,
+        user: player,
+        member: invocation.member,
 
         discord: {
-            id: msg.author.id,
-            tag: msg.author.tag,
-            username: msg.author.username,
-            displayName: member?.displayName || msg.author.username,
-            rank: rankName,
-            level,
-            permissionLevel: level,
-            member
+            id: invocation.user?.id,
+            tag: invocation.user?.tag,
+            username: invocation.user?.username,
+            displayName: displayName(invocation.member, invocation.user),
+            rank: invocation.rank,
+            level: invocation.level,
+            permissionLevel: invocation.level,
+            member: invocation.member
         },
 
-        level,
-        rank: rankName,
-        levels,
+        level: invocation.level,
+        rank: invocation.rank,
+        levels: LEVELS,
 
         command: cmd,
-        commandName: cmd.name || name,
-        args,
-        raw: [name, ...args].join(' '),
+        commandName: cmd.name,
+        args: invocation.args,
+        raw: invocation.raw,
 
-        message: msg,
-        prefix: global.commandPrefix,
-        source: 'discord',
+        message: invocation.message,
+        interaction: invocation.interaction,
+        source: invocation.source,
+        prefix: bridge.prefix,
 
         commands,
         commandsDir: path.join(process.cwd(), 'commands'),
-        core: bot.core,
+        core: bot?.core,
 
-        run: async x => {
-            const command = String(x);
+        run: command => {
+            const text = String(command);
 
-            const match = /^\/?tellraw\s+\S+\s+([\s\S]+)$/i.exec(command);
+            const match = /^\/?tellraw\s+\S+\s+([\s\S]+)$/i.exec(text);
 
             if (match) {
                 let component;
@@ -788,52 +1221,433 @@ async function handleCommand(client, msg) {
                     }
                 }
 
-                return send(toPlain(component));
+                send(toPlain(component));
+                return true;
             }
 
-            return bot.core?.run(command);
+            return runCore(bot, text);
         },
 
-        tellraw: async (who, x) => send(toPlain(x)),
-        tellrawCommand: async x => send(toPlain(x)),
-        reply: async x => send(x)
+        tellraw: (who, value) => {
+            send(toPlain(value));
+            return true;
+        },
+
+        tellrawCommand: value => {
+            send(toPlain(value));
+            return true;
+        },
+
+        reply: value => {
+            send(value);
+            return true;
+        }
     };
+}
+
+async function runMinecraftCommand(cmd, bot, args, invocation) {
+    const required = requiredLevel(cmd.level);
+
+    if (invocation.level < required) {
+        return sendPermissionDenied(
+            invocation.responder,
+            invocation.rank,
+            required,
+            invocation.source === 'slash'
+        );
+    }
+
+    const ctx = buildMinecraftContext(cmd, { ...invocation, bot, args });
 
     try {
         const result = await cmd.execute(ctx);
 
-        if (result instanceof EmbedBuilder) {
-            await sendCommandOutput(msg, result, {
-                color: rankColor
-            });
-        } else if (result?.embed) {
-            await sendCommandOutput(msg, result.embed, {
-                color: rankColor
-            });
-        } else if (typeof result === 'string' && result.trim()) {
-            await send(result);
-        }
+        if (result == null) return;
 
-    } catch (e) {
-        console.error(`[${bot.id}] [Discord] Command error:`, e);
+        await sendOutput(invocation.responder, result, {
+            title: 'Command response',
+            color: rankColor(invocation.rank),
+            footer: `${FOOTER} • ${invocation.rank}`
+        });
+    } catch (error) {
+        fail(`Minecraft command "${cmd.name}" on ${bot.id} failed:`, error);
 
-        await sendCommandOutput(
-            msg,
-            `An error occurred while executing this command.\n\`\`\`\n${String(e.message || e).slice(0, 1000)}\n\`\`\``,
-            {
-                title: 'Command error',
-                color: COLORS.error
-            }
+        await sendOutput(
+            invocation.responder,
+            `Could not run \`${cmd.name}\` on **${bot.id}**.\n\`\`\`\n${truncate(error?.message || error, 1000)}\n\`\`\``,
+            { title: 'Command error', color: COLORS.error }
+        );
+    }
+}
+
+async function runMinecraftCommandByName(bot, words, invocation) {
+    const name = String(words[0] ?? '').replace(/^[!/]/, '').toLowerCase();
+    const args = words.slice(1);
+
+    if (!name) {
+        return sendOutput(invocation.responder, 'Usage: `mc <command>` or `mc <server> <command>`.', {
+            title: 'Minecraft command',
+            color: COLORS.error
+        });
+    }
+
+    const cmd = bot?.commands?.get?.(name);
+
+    if (!cmd) {
+        return sendOutput(
+            invocation.responder,
+            `Unknown command \`${name}\` on **${bot.id}**.`,
+            { title: 'Minecraft command', color: COLORS.error }
         );
     }
 
-    return true;
+    return runMinecraftCommand(cmd, bot, args, invocation);
 }
 
-function setupDC(config) {
-    if (global.discordClient) return;
+function parseInputWords(value) {
+    const text = String(value ?? '').trim();
+    return text ? text.split(/\s+/) : [];
+}
 
-    global.commandPrefix = config.commandPrefix || '!';
+function commandsChannelId() {
+    return String(
+        bridge.config?.commandsChannelId ||
+        bridge.config?.messagesId ||
+        ''
+    ).trim();
+}
+
+async function handlePrefixCommand(message, name, args) {
+    const config = bridge.config;
+    const rank = rankOf(message.member, config);
+    const responder = new Responder(message);
+    const invocation = {
+        source: 'prefix',
+        message,
+        interaction: null,
+        member: message.member,
+        user: message.author,
+        guild: message.guild,
+        channel: message.channel,
+        args,
+        raw: [name, ...args].join(' '),
+        rank,
+        level: levelOf(rank),
+        responder,
+        bot: defaultBot(message.channel.id)
+    };
+
+    const discordCommand = global.discordCommands.get(name);
+
+    if (discordCommand) {
+        await runDiscordCommand(discordCommand, invocation);
+        return true;
+    }
+
+    if (name === 'mc' || name === 'minecraft') {
+        let target = invocation.bot;
+        let words = [...args];
+
+        if (words.length > 1) {
+            const explicit = getBot(words[0]);
+
+            if (explicit) {
+                target = explicit;
+                words = words.slice(1);
+            }
+        }
+
+        if (!target) {
+            await sendOutput(responder, `Choose a server: ${serverList() || 'none registered'}.`, {
+                title: 'Minecraft command',
+                color: COLORS.error
+            });
+            return true;
+        }
+
+        await runMinecraftCommandByName(target, words, { ...invocation, bot: target });
+        return true;
+    }
+
+    // In-game commands are reachable from the channel bridged to a bot or
+    // from the dedicated commands channel. Elsewhere `mc` is the explicit path.
+    const linked = linkedBot(message.channel.id);
+    const dedicated = commandsChannelId();
+    const inCommandsChannel = Boolean(dedicated) && String(message.channel.id) === dedicated;
+
+    if (linked || inCommandsChannel) {
+        let target = linked;
+        let cmdArgs = args;
+
+        if (!target) {
+            const explicit = args.length > 1 ? getBot(args[0]) : null;
+            const list = bots();
+
+            if (explicit) {
+                target = explicit;
+                cmdArgs = args.slice(1);
+            } else if (list.length === 1) {
+                target = list[0];
+            } else {
+                await sendOutput(
+                    responder,
+                    `Choose a server: ${serverList() || 'none registered'}.`,
+                    { title: 'Minecraft command', color: COLORS.error }
+                );
+                return true;
+            }
+        }
+
+        const cmd = target?.commands?.get?.(name);
+
+        if (cmd) {
+            await runMinecraftCommand(cmd, target, cmdArgs, { ...invocation, bot: target });
+            return true;
+        }
+
+        if (inCommandsChannel) {
+            await sendOutput(responder, `Unknown command \`${name}\`. Try \`${bridge.prefix}help\`.`, {
+                title: 'Command error',
+                color: COLORS.error
+            });
+            return true;
+        }
+    }
+
+    return false;
+}
+
+async function handleMessage(message) {
+    if (!message.inGuild?.() || message.author?.bot || message.system) return;
+
+    const channel = message.channel;
+    if (!channel?.isTextBased?.() || channel.isDMBased?.()) return;
+
+    const content = message.content || '';
+
+    if (content.startsWith(bridge.prefix) && content.length > bridge.prefix.length) {
+        const raw = content.slice(bridge.prefix.length).trim();
+        const [name, ...args] = raw.split(/\s+/);
+
+        if (name) {
+            const handled = await handlePrefixCommand(message, name.toLowerCase(), args);
+            if (handled) return;
+        }
+    }
+
+    const bot = linkedBot(channel.id);
+    if (!bot) return;
+
+    await relayDiscordMessage(bot, message);
+}
+
+async function handleInteraction(interaction) {
+    if (!interaction.inGuild?.()) {
+        await interaction.reply({
+            content: 'This bot only accepts commands inside a server.',
+            flags: MessageFlags.Ephemeral
+        }).catch(() => {});
+        return;
+    }
+
+    const config = bridge.config;
+    const rank = rankOf(interaction.member, config);
+    const name = interaction.commandName;
+    const responder = new Responder(interaction);
+
+    const invocation = {
+        source: 'slash',
+        message: interaction,
+        interaction,
+        member: interaction.member,
+        user: interaction.user,
+        guild: interaction.guild,
+        channel: interaction.channel,
+        args: [],
+        raw: '',
+        rank,
+        level: levelOf(rank),
+        responder,
+        bot: defaultBot(interaction.channelId)
+    };
+
+    try {
+        if (name === 'mc') {
+            const command = interaction.options.getString('command', true);
+            const server = interaction.options.getString('server');
+            const target = server ? getBot(server) : invocation.bot;
+
+            if (!target) {
+                await interaction.reply({
+                    embeds: [
+                        createEmbed(`Choose a server: ${serverList() || 'none registered'}.`, {
+                            title: 'Minecraft command',
+                            color: COLORS.error
+                        })
+                    ],
+                    flags: MessageFlags.Ephemeral
+                });
+                return;
+            }
+
+            await interaction.deferReply();
+
+            invocation.bot = target;
+            invocation.args = parseInputWords(command);
+            invocation.raw = command;
+
+            await runMinecraftCommandByName(target, invocation.args, invocation);
+            return;
+        }
+
+        const cmd = global.discordCommands.get(name);
+
+        if (!cmd) {
+            await interaction.reply({
+                embeds: [createEmbed('Unknown command.', { title: 'Command error', color: COLORS.error })],
+                flags: MessageFlags.Ephemeral
+            });
+            return;
+        }
+
+        const required = commandLevel(cmd);
+
+        if (invocation.level < required) {
+            await sendPermissionDenied(responder, rank, required, true);
+            return;
+        }
+
+        await interaction.deferReply();
+
+        const input = interaction.options.getString('input') ?? '';
+        invocation.args = parseInputWords(input);
+        invocation.raw = input;
+
+        await runDiscordCommand(cmd, invocation);
+    } catch (error) {
+        fail(`Interaction "${name}" failed:`, error);
+
+        const payload = {
+            embeds: [
+                createEmbed('An error occurred while running this command.', {
+                    title: 'Command error',
+                    color: COLORS.error
+                })
+            ],
+            allowedMentions: mentionSafe()
+        };
+
+        try {
+            if (interaction.deferred || interaction.replied) {
+                await interaction.followUp(payload);
+            } else {
+                await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
+            }
+        } catch {
+            // Interaction may have expired.
+        }
+    }
+}
+
+function bindClient(client) {
+    client.once('ready', () => {
+        bridge.ready = true;
+        bridge.disabled = false;
+        bridge.loginAttempts = 0;
+        global.clientReady = true;
+        log(`Logged in as ${client.user.tag}`);
+
+        loadCommands();
+        void registerSlashCommands();
+        flushRelays();
+    });
+
+    client.on('messageCreate', message => {
+        handleMessage(message).catch(error => fail('message handler failed:', error));
+    });
+
+    client.on('interactionCreate', interaction => {
+        if (!interaction.isChatInputCommand?.()) return;
+
+        handleInteraction(interaction).catch(error => fail('interaction handler failed:', error));
+    });
+
+    client.on('shardReady', id => {
+        global.clientReady = true;
+        log(`Shard ${id} ready`);
+        flushRelays();
+    });
+
+    client.on('shardDisconnect', (event, id) => {
+        global.clientReady = false;
+        warn(`Shard ${id} disconnected (code ${event?.code ?? 'unknown'})`);
+    });
+
+    client.on('shardError', (error, id) => {
+        fail(`Shard ${id} error:`, error);
+    });
+
+    client.on('invalidated', () => {
+        fail('Session invalidated; reconnecting in 10s');
+        bridge.ready = false;
+        global.clientReady = false;
+        global.discordClient = null;
+        bridge.client = null;
+
+        try {
+            client.destroy();
+        } catch {
+            // Already gone.
+        }
+
+        scheduleClientRetry(new Error('session invalidated'));
+    });
+
+    client.on('error', error => fail('Client error:', error));
+    client.on('warn', message => warn(message));
+}
+
+function scheduleClientRetry(error) {
+    if (bridge.retryTimer) return;
+
+    if (error?.code === 'TokenInvalid' || /invalid token/i.test(error?.message || '')) {
+        bridge.disabled = true;
+        fail('Discord token is invalid; fix discord.token and restart.');
+        return;
+    }
+
+    bridge.loginAttempts++;
+
+    if (bridge.loginAttempts > 5) {
+        fail('Giving up on Discord after 5 failed login attempts.');
+        return;
+    }
+
+    const delay = Math.min(30000, 5000 * bridge.loginAttempts);
+
+    warn(`Retrying Discord login in ${delay}ms (attempt ${bridge.loginAttempts})`);
+
+    bridge.retryTimer = setTimeout(() => {
+        bridge.retryTimer = null;
+        ensureClient();
+    }, delay);
+
+    bridge.retryTimer.unref?.();
+}
+
+function ensureClient() {
+    if (bridge.disabled) return null;
+    if (bridge.client && !bridge.client.destroyed) return bridge.client;
+
+    bridge.client = null;
+
+    const config = bridge.config;
+
+    if (!config?.token) {
+        bridge.disabled = true;
+        fail('No bot token configured (discord.token); Discord integration is disabled.');
+        return null;
+    }
 
     const client = new Client({
         intents: [
@@ -841,189 +1655,65 @@ function setupDC(config) {
             GatewayIntentBits.GuildMessages,
             GatewayIntentBits.MessageContent
         ],
-        partials: [
-            Partials.Channel
-        ]
+        partials: [Partials.Channel],
+        allowedMentions: mentionSafe()
     });
 
+    bridge.client = client;
     global.discordClient = client;
 
-    client.once('ready', () => {
-        global.clientReady = true;
-        loadCmds();
+    bindClient(client);
 
-        console.log(`[Discord] Logged in as ${client.user.tag}`);
-    });
+    client.login(config.token).catch(error => {
+        fail('Login failed:', error.message);
+        global.discordClient = null;
+        bridge.client = null;
 
-    client.on('messageCreate', async msg => {
-        if (msg.author.bot) return;
-        if (!msg.guild) return;
-        if (msg.channel.type !== ChannelType.GuildText) return;
-
-        if (msg.content.startsWith(global.commandPrefix)) {
-            if (await handleCommand(client, msg)) return;
+        try {
+            client.destroy();
+        } catch {
+            // Already gone.
         }
 
-        const target = global.channelMap.get(msg.channel.id);
-
-        if (!target) return;
-
-        await handleMsg(target, msg);
+        scheduleClientRetry(error);
     });
 
-    client.on('error', e => {
-        console.error('[Discord] Client error:', e);
-    });
+    return client;
+}
 
-    client.on('shardDisconnect', () => {
-        global.clientReady = false;
-    });
+function setup(bot) {
+    const config = bot.globalConfig?.discord;
 
-    client.on('shardReady', () => {
-        global.clientReady = true;
-    });
+    if (!config?.enabled) return false;
 
-    client.login(config.token).catch(e => {
-        console.error('[Discord] Login error:', e);
-    });
+    if (!bridge.config) {
+        bridge.config = config;
+        bridge.prefix = String(config.commandPrefix || COMMAND_PREFIX);
+        global.commandPrefix = bridge.prefix;
+    }
+
+    return true;
 }
 
 module.exports = function discordBridge(bot) {
-    const gconf = bot.globalConfig;
-    const dconf = gconf?.discord;
+    if (!setup(bot)) return;
+    if (!ensureClient()) return;
 
-    if (!dconf || !dconf.enabled) return;
+    registerBot(bot);
 
-    const cid = bot.config.channelId;
+    log(`Bridge active for "${bot.id}"${bot.config?.channelId ? ` (channel ${bot.config.channelId})` : ''}`);
+};
 
-    if (!cid) {
-        console.log(`[${bot.id}] [Discord] No channelId, skipping.`);
-        return;
-    }
-
-    if (!global.discordClient) {
-        setupDC(dconf);
-    }
-
-    if (!global.channelMap.has(cid)) {
-        global.channelMap.set(cid, bot);
-    } else if (global.channelMap.get(cid) !== bot) {
-        console.log(
-            `[${bot.id}] [Discord] Log channel ${cid} already registered by another bot, skipping.`
-        );
-
-        return;
-    }
-
-    let buf = [];
-    let timer = null;
-
-    const INTERVAL = 900;
-    const MAX_BUF = 50;
-    const MAX_MESSAGE_LENGTH = 1900;
-
-    async function flush() {
-        if (!buf.length) return;
-
-        const messages = buf.splice(0, buf.length);
-
-        if (!global.clientReady) return;
-
-        try {
-            const ch = await global.discordClient.channels.fetch(cid);
-
-            if (!ch) return;
-
-            let combined = messages.join('\n');
-
-            while (combined.length > 0) {
-                let chunk = combined.slice(0, MAX_MESSAGE_LENGTH);
-
-                if (combined.length > MAX_MESSAGE_LENGTH) {
-                    const newline = chunk.lastIndexOf('\n');
-
-                    if (newline > MAX_MESSAGE_LENGTH * 0.5) {
-                        chunk = chunk.slice(0, newline);
-                    }
-                }
-
-                await ch.send({
-                    content: `\`\`\`\n${chunk}\n\`\`\``,
-                    allowedMentions: {
-                        parse: [],
-                        repliedUser: false
-                    }
-                });
-
-                combined = combined.slice(chunk.length).replace(/^\n+/, '');
-            }
-
-        } catch (e) {
-            console.error(`[${bot.id}] [Discord] Chat send error:`, e);
-        }
-    }
-
-    function addMsg(text) {
-        if (!text || !String(text).trim()) return;
-
-        const safeText = String(text).replaceAll('`', '\u200b`');
-
-        if (buf.length >= MAX_BUF) {
-            buf.shift();
-        }
-
-        if (buf.length > 0 && buf[buf.length - 1] === safeText) {
-            return;
-        }
-
-        buf.push(safeText);
-
-        if (!timer) {
-            timer = setTimeout(async () => {
-                timer = null;
-                await flush();
-            }, INTERVAL);
-        }
-    }
-
-    const handlers = {
-        onDisconnect() {
-            if (timer) {
-                clearTimeout(timer);
-                timer = null;
-            }
-
-            flush().finally(destroy);
-        },
-
-        onChatDisplay(message) {
-            if (!message) return;
-            addMsg(message);
-        }
-    };
-
-    bot.on('bot:disconnect', handlers.onDisconnect);
-    bot.on('chat_display', handlers.onChatDisplay);
-
-    function destroy() {
-        if (timer) {
-            clearTimeout(timer);
-            timer = null;
-        }
-
-        buf = [];
-
-        bot.removeListener('bot:disconnect', handlers.onDisconnect);
-        bot.removeListener('chat_display', handlers.onChatDisplay);
-
-        if (global.channelMap.get(cid) === bot) {
-            global.channelMap.delete(cid);
-        }
-
-        if (bot.discordBridgeDestroy === destroy) {
-            bot.discordBridgeDestroy = null;
-        }
-    }
-
-    bot.discordBridgeDestroy = destroy;
+// Exposed for tests and tooling; not part of the bot API.
+module.exports._internal = {
+    LEVELS,
+    requiredLevel,
+    rankOf,
+    splitText,
+    stripMarkdown,
+    formatMentions,
+    toSNBT,
+    parseSNBT,
+    takeBatch,
+    protectFences
 };
