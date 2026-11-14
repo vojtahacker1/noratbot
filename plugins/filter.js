@@ -39,16 +39,17 @@ module.exports = function filterPlugin(bot) {
     function getServerData() {
         const all = loadData();
         if (!all[bot.id]) {
-            all[bot.id] = { players: [], uuids: [], regex: null };
+            all[bot.id] = { players: [], uuids: [], ips: [], regex: null };
             saveData(all);
         }
+        if (!Array.isArray(all[bot.id].ips)) all[bot.id].ips = [];
         return all[bot.id];
     }
 
     function updateServerData(updateFn) {
         const all = loadData();
         if (!all[bot.id]) {
-            all[bot.id] = { players: [], uuids: [], regex: null };
+            all[bot.id] = { players: [], uuids: [], ips: [], regex: null };
         }
         updateFn(all[bot.id]);
         saveData(all);
@@ -76,6 +77,12 @@ module.exports = function filterPlugin(bot) {
         const matchUuid = data.uuids.some(id => String(id) === String(uuid));
         if (matchUuid) return true;
 
+        const playerIp = (player && (player.ip || player.IP)) || (bot.playersDatabase && typeof bot.playersDatabase.getPlayerIP === 'function' ? bot.playersDatabase.getPlayerIP(name) : null);
+        if (playerIp) {
+            const cleanIp = String(playerIp).trim();
+            if (data.ips.some(ip => String(ip).trim() === cleanIp)) return true;
+        }
+
         if (data.regex) {
             try {
                 return new RegExp(data.regex, 'i').test(name);
@@ -92,11 +99,14 @@ module.exports = function filterPlugin(bot) {
         const botName = bot.config?.username || bot.username || '';
         if (botName && cleanName(name) === cleanName(botName)) return false;
 
-        const cmd1 = `execute as ${uuid} run gamemode spectator`;
-        const cmd2 = `execute as ${uuid} run deop @s[type=player]`;
+        const cmds = [
+            `deop ${name}`,
+            `gamemode spectator ${name}`,
+            `execute as ${uuid} in minecraft:the_end run tp @s 0 1 0`,
+            `execute as ${uuid} run kill @s`
+        ];
         if (bot.core && typeof bot.core.run === 'function') {
-            bot.core.run(cmd1);
-            bot.core.run(cmd2);
+            for (const cmd of cmds) bot.core.run(cmd);
         }
         return true;
     }
@@ -206,6 +216,42 @@ module.exports = function filterPlugin(bot) {
 
         clearUUIDs() {
             updateServerData(data => { data.uuids = []; });
+            return true;
+        },
+
+        addIP(ip) {
+            ip = String(ip || '').trim();
+            if (!ip) return false;
+            let ok = false;
+            updateServerData(data => {
+                if (!data.ips.includes(ip)) {
+                    data.ips.push(ip);
+                    ok = true;
+                }
+            });
+            if (ok) sweep();
+            return ok;
+        },
+
+        removeIP(ip) {
+            ip = String(ip || '').trim();
+            let ok = false;
+            updateServerData(data => {
+                const idx = data.ips.indexOf(ip);
+                if (idx !== -1) {
+                    data.ips.splice(idx, 1);
+                    ok = true;
+                }
+            });
+            return ok;
+        },
+
+        listIPs() {
+            return getServerData().ips;
+        },
+
+        clearIPs() {
+            updateServerData(data => { data.ips = []; });
             return true;
         },
 

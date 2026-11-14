@@ -32,17 +32,22 @@ module.exports = {
             const players = f.listPlayers() || [];
             const uuids = f.listUUIDs() || [];
             const regex = f.getRegex();
-            say(`Players: ${players.length ? players.join(', ') : '(empty)'}\nUUIDs: ${uuids.length ? uuids.join(', ') : '(empty)'}\nRegex: ${regex || '(none)'}`);
+            const ips = f.listIPs() || [];
+            say(`Players: ${players.length ? players.join(', ') : '(empty)'}\nUUIDs: ${uuids.length ? uuids.join(', ') : '(empty)'}\nIPs: ${ips.length ? ips.join(', ') : '(empty)'}\nRegex: ${regex || '(none)'}`);
             return;
         }
 
         if (sub === 'add') {
             if (!rest.length) return say('Usage: filter add <name or UUID>');
             const val = rest.join(' ');
+            const isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(val);
             let ok;
             if (isUuid(val)) {
                 ok = f.addUUID(val);
                 say(ok ? `Added UUID "${val}" to filter list` : `Failed to add UUID to filter list (maybe exists)`);
+            } else if (isIp) {
+                ok = f.addIP(val);
+                say(ok ? `Added IP "${val}" to filter list` : `Failed to add IP to filter list (maybe exists)`);
             } else {
                 ok = f.addPlayer(val);
                 say(ok ? `Added player "${val}" to filter list` : `Failed to add player to filter list (maybe exists)`);
@@ -53,12 +58,16 @@ module.exports = {
         if (sub === 'remove') {
             if (!rest.length) return say('Usage: filter remove <name or UUID>');
             const val = rest.join(' ');
+            const isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(val);
             let ok = false;
             if (isUuid(val)) {
                 ok = f.removeUUID(val);
+            } else if (isIp) {
+                ok = f.removeIP(val);
             } else {
                 ok = f.removePlayer(val);
                 if (!ok) ok = f.removeUUID(val);
+                if (!ok) ok = f.removeIP(val);
             }
             say(ok ? `Removed "${val}" from filter list` : `Failed to remove "${val}" from filter list (not found)`);
             return;
@@ -89,6 +98,28 @@ module.exports = {
         if (sub === 'clear-uuid') {
             const ok = f.clearUUIDs();
             say(ok ? 'Cleared all UUIDs from filter list' : 'Failed to clear UUIDs from filter list');
+            return;
+        }
+
+        if (sub === 'add-ip') {
+            if (!rest.length) return say('Usage: filter add-ip <ip>');
+            const val = rest.join(' ').trim();
+            const ok = f.addIP(val);
+            say(ok ? `Added IP "${val}" to filter list` : `Failed to add IP to filter list (maybe exists)`);
+            return;
+        }
+
+        if (sub === 'remove-ip') {
+            if (!rest.length) return say('Usage: filter remove-ip <ip>');
+            const val = rest.join(' ').trim();
+            const ok = f.removeIP(val);
+            say(ok ? `Removed IP "${val}" from filter list` : `Failed to remove IP from filter list (not found)`);
+            return;
+        }
+
+        if (sub === 'clear-ip') {
+            const ok = f.clearIPs();
+            say(ok ? 'Cleared all IPs from filter list' : 'Failed to clear IPs from filter list');
             return;
         }
 
