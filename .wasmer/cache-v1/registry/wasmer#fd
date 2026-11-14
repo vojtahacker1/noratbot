@@ -1,0 +1,49 @@
+{
+  "unix_timestamp": 1794661569,
+  "package_name": "wasmer/fd",
+  "response": {
+    "data": {
+      "getPackage": {
+        "packageName": "fd",
+        "namespace": "wasmer",
+        "versions": [
+          {
+            "version": "10.5.1",
+            "isArchived": false,
+            "v2": {
+              "webcSize": null,
+              "piritaDownloadUrl": null,
+              "piritaSha256Hash": null,
+              "webcManifest": null
+            },
+            "v3": {
+              "webcSize": 3296386,
+              "piritaDownloadUrl": "https://cdn.wasmer.io/webcimages/f1125f53ce2ea55d75cc2a29d7ae9ffdffa9241a3038aee78c124d93752a1583.webc",
+              "piritaSha256Hash": "f1125f53ce2ea55d75cc2a29d7ae9ffdffa9241a3038aee78c124d93752a1583",
+              "webcManifest": "{\"atoms\":{\"fd\":{\"annotations\":{\"wasm\":{\"features\":[\"simd\",\"bulk-memory\",\"reference-types\",\"multi-value\",\"threads\",\"exception-handling\",\"multi-memory\"]}},\"kind\":\"https://webc.org/kind/wasm\",\"signature\":\"sha256:41KI1VFQGy7ODFHudtAC3lx+COaorMNwSP618ZJBb7Y=\"}},\"commands\":{\"fd\":{\"annotations\":{\"atom\":{\"name\":\"fd\"},\"wasi\":{\"atom\":\"fd\"}},\"runner\":\"https://webc.org/runner/wasi\"}},\"entrypoint\":\"fd\",\"package\":{\"fs\":[{\"from\":null,\"mount_path\":\"/opt/fd/licenses\",\"volume_name\":\"/.wasix/licenses\"}],\"wapm\":{\"license\":\"MIT OR Apache-2.0\",\"readme\":{\"path\":\"/WASIX.md\",\"volume\":\"metadata\"},\"repository\":\"https://github.com/wasix-org/fd\"}}}"
+            }
+          },
+          {
+            "version": "10.5.0",
+            "isArchived": false,
+            "v2": {
+              "webcSize": null,
+              "piritaDownloadUrl": null,
+              "piritaSha256Hash": null,
+              "webcManifest": null
+            },
+            "v3": {
+              "webcSize": 3296186,
+              "piritaDownloadUrl": "https://cdn.wasmer.io/webcimages/40a3c84309bee167d4a29829f02c468a04a11cfb4bd67418d6da4ccdf609165d.webc",
+              "piritaSha256Hash": "40a3c84309bee167d4a29829f02c468a04a11cfb4bd67418d6da4ccdf609165d",
+              "webcManifest": "{\"atoms\":{\"fd\":{\"annotations\":{\"wasm\":{\"features\":[\"simd\",\"bulk-memory\",\"reference-types\",\"multi-value\",\"threads\",\"exception-handling\",\"multi-memory\"]}},\"kind\":\"https://webc.org/kind/wasm\",\"signature\":\"sha256:41KI1VFQGy7ODFHudtAC3lx+COaorMNwSP618ZJBb7Y=\"}},\"commands\":{\"fd\":{\"annotations\":{\"atom\":{\"name\":\"fd\"},\"wasi\":{\"atom\":\"fd\"}},\"runner\":\"https://webc.org/runner/wasi\"}},\"entrypoint\":\"fd\",\"package\":{\"fs\":[{\"from\":null,\"mount_path\":\"/usr/share/licenses/fd\",\"volume_name\":\"/.wasix/licenses\"}],\"wapm\":{\"license\":\"MIT OR Apache-2.0\",\"readme\":{\"path\":\"/WASIX.md\",\"volume\":\"metadata\"},\"repository\":\"https://github.com/wasix-org/fd\"}}}"
+            }
+          }
+        ]
+      },
+      "info": {
+        "defaultFrontend": "https://wasmer.io/"
+      }
+    }
+  }
+}
