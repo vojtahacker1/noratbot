@@ -131,6 +131,14 @@
     "backupOffset": 1000
   },
 
+  "failover": {
+    "enabled": true,
+    "role": "executor",
+    "heartbeatMs": 3000,
+    "timeoutMs": 15000,
+    "lives": 2
+  },
+
   "logging": {
     "chat": true,
     "commands": true,
