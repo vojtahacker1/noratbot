@@ -1,4 +1,3 @@
-```yaml
 name: NoratBot
 
 on:
@@ -47,23 +46,32 @@ jobs:
           : "${BOT_TRUSTED_KEY:?Missing BOT_TRUSTED_KEY}"
           : "${BOT_ADMIN_KEY:?Missing BOT_ADMIN_KEY}"
 
-          # Generate a random username.
-          RANDOM_USERNAME="norat_$(openssl rand -hex 12)"
-
           jq \
             --arg token "$DISCORD_TOKEN" \
             --arg trusted "$BOT_TRUSTED_KEY" \
             --arg admin "$BOT_ADMIN_KEY" \
-            --arg random_username "$RANDOM_USERNAME" \
             '
             .discord.token = $token |
             .bot.trustedKey = $trusted |
-            .bot.adminKey = $admin |
-            if .bot.username == "random"
-            then .bot.username = $random_username
-            else .
-            end
+            .bot.adminKey = $admin
             ' config.example.json > config.json.tmp
+
+          # Replace every exact "random" server username.
+          for i in $(jq -r '
+            .minecraft.servers | to_entries[] |
+            select(.value.username == "random") | .key
+          ' config.json.tmp); do
+
+            USERNAME="$(openssl rand -hex 3 | cut -c1-5)"
+
+            jq \
+              --argjson i "$i" \
+              --arg username "$USERNAME" \
+              '.minecraft.servers[$i].username = $username' \
+              config.json.tmp > config.json.new
+
+            mv config.json.new config.json.tmp
+          done
 
           mv config.json.tmp config.json
 
@@ -126,7 +134,7 @@ jobs:
           git add -A
 
           if git diff --cached --quiet; then
-            echo "No changes to commit."
+            :
           else
             git -c core.hooksPath=/dev/null commit \
               -m "chore: persist bot data"
@@ -156,4 +164,3 @@ jobs:
           gh api --method POST \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_ID}/dispatches" \
             -f ref="$GITHUB_REF_NAME"
-```
