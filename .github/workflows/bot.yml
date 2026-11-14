@@ -1,4 +1,4 @@
-
+```yaml
 name: NoratBot
 
 on:
@@ -30,13 +30,14 @@ jobs:
           cache: npm
 
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --silent
 
       - name: Generate configuration
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           BOT_TRUSTED_KEY: ${{ secrets.BOT_TRUSTED_KEY }}
           BOT_ADMIN_KEY: ${{ secrets.BOT_ADMIN_KEY }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -46,14 +47,22 @@ jobs:
           : "${BOT_TRUSTED_KEY:?Missing BOT_TRUSTED_KEY}"
           : "${BOT_ADMIN_KEY:?Missing BOT_ADMIN_KEY}"
 
+          # Generate a random username.
+          RANDOM_USERNAME="norat_$(openssl rand -hex 12)"
+
           jq \
             --arg token "$DISCORD_TOKEN" \
             --arg trusted "$BOT_TRUSTED_KEY" \
             --arg admin "$BOT_ADMIN_KEY" \
+            --arg random_username "$RANDOM_USERNAME" \
             '
             .discord.token = $token |
             .bot.trustedKey = $trusted |
-            .bot.adminKey = $admin
+            .bot.adminKey = $admin |
+            if .bot.username == "random"
+            then .bot.username = $random_username
+            else .
+            end
             ' config.example.json > config.json.tmp
 
           mv config.json.tmp config.json
@@ -68,36 +77,25 @@ jobs:
 
           deadline=$((SECONDS + RUN_WINDOW_SECONDS))
 
-          echo "NoratBot supervisor started."
-
           while (( SECONDS < deadline )); do
             remaining=$((deadline - SECONDS))
-
-            echo "Starting node index.js"
 
             set +e
             timeout \
               --signal=INT \
               --kill-after=15s \
               "${remaining}s" \
-              node index.js
+              node index.js >/dev/null 2>&1
 
             exit_code=$?
             set -e
 
             if (( SECONDS >= deadline )); then
-              echo "Session time limit reached."
               break
             fi
 
-            echo "Bot exited with code $exit_code."
-            echo "Restarting in ${RESTART_DELAY} seconds..."
-
             sleep "$RESTART_DELAY"
           done
-
-          echo "Bot session finished."
-
 
       - name: Commit and push bot changes
         id: persist
@@ -114,7 +112,6 @@ jobs:
           git remote set-url origin \
             "https://github.com/${GITHUB_REPOSITORY}.git"
 
-          # Ensure generated files are always ignored.
           touch .gitignore
 
           for entry in "/config.json" "/config.json.tmp" "/node_modules/"; do
@@ -123,11 +120,9 @@ jobs:
             fi
           done
 
-          # Remove generated files from Git tracking without deleting them.
           git rm -r --cached --ignore-unmatch -- \
             config.json config.json.tmp node_modules
 
-          # Stage all other changes normally.
           git add -A
 
           if git diff --cached --quiet; then
@@ -142,9 +137,6 @@ jobs:
               push origin "HEAD:${GITHUB_REF_NAME}"
           fi
 
-          echo "Changes persisted successfully."
-
-
       - name: Automatically start next session
         if: steps.persist.outcome == 'success'
         env:
@@ -153,21 +145,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Finding NoratBot workflow..."
-
           WORKFLOW_ID="$(gh api \
             "repos/${GITHUB_REPOSITORY}/actions/workflows" \
             --jq '[.workflows[] | select(.name == "NoratBot" and .state == "active")] | first | .id')"
 
           if [[ -z "$WORKFLOW_ID" || "$WORKFLOW_ID" == "null" ]]; then
-            echo "Could not find NoratBot workflow."
             exit 1
           fi
-
-          echo "Dispatching next session..."
 
           gh api --method POST \
             "repos/${GITHUB_REPOSITORY}/actions/workflows/${WORKFLOW_ID}/dispatches" \
             -f ref="$GITHUB_REF_NAME"
-
-          echo "Next session successfully queued."
+```
