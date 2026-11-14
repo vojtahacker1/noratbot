@@ -74,9 +74,16 @@ module.exports = function playersDatabase(bot) {
         saveSoon();
     }
 
-    function setIP(uuid, ip, serverId = server) {
+    function setIP(uuid, ip, serverId = server, time = Date.now()) {
         if (!uuid || !ip) return false;
-        (data.ips[serverId] ||= {})[uuid] = String(ip).trim();
+        ip = String(ip).trim();
+        (data.ips[serverId] ||= {})[uuid] = ip;
+        const info = data.players[uuid];
+        if (info) {
+            if (!info.ips || typeof info.ips !== 'object' || Array.isArray(info.ips)) info.ips = {};
+            const prev = Number(info.ips[ip]) || 0;
+            if (time > prev) info.ips[ip] = time;
+        }
         saveSoon();
         return true;
     }
@@ -114,6 +121,49 @@ module.exports = function playersDatabase(bot) {
         const out = new Map();
         for (const r of rows.slice(0, limit)) out.set(r.username, { lastSeen: r.lastSeen, server: r.server });
         return out;
+    }
+
+    // list every IP a player with this username has joined with, deduped by IP
+    function getPlayerIPs(username, allServers = false) {
+        const key = clean(username).toLowerCase();
+        if (!key) return [];
+        const serverIds = allServers ? Object.keys(data.ips) : [server];
+        const byIp = new Map();
+
+        for (const serverId of serverIds) {
+            for (const [uuid, storedIP] of Object.entries(data.ips[serverId] || {})) {
+                const info = data.players[uuid];
+                if (!info || clean(info.username).toLowerCase() !== key) continue;
+                const ip = String(storedIP).trim();
+                let time = 0;
+                if (info.ips && typeof info.ips === 'object' && !Array.isArray(info.ips)) {
+                    time = Number(info.ips[ip]) || 0;
+                }
+                if (!time) time = Number(info.lastSeenTime) || 0;
+                const prev = byIp.get(ip);
+                if (!prev || time > prev.time) {
+                    byIp.set(ip, { ip, time, server: info.lastSeenServer || serverId });
+                }
+            }
+        }
+
+        // include historical IPs that are no longer the current IP for any uuid
+        for (const info of Object.values(data.players)) {
+            if (clean(info.username).toLowerCase() !== key) continue;
+            if (!info.ips || typeof info.ips !== 'object' || Array.isArray(info.ips)) continue;
+            if (!allServers && info.lastSeenServer && info.lastSeenServer !== server) continue;
+            for (const [ipRaw, timeRaw] of Object.entries(info.ips)) {
+                const ip = String(ipRaw).trim();
+                if (!ip) continue;
+                const time = Number(timeRaw) || 0;
+                const prev = byIp.get(ip);
+                if (!prev || time > prev.time) {
+                    byIp.set(ip, { ip, time, server: info.lastSeenServer || server });
+                }
+            }
+        }
+
+        return [...byIp.values()].sort((a, b) => b.time - a.time);
     }
 
     // [lastSeenTime, lastSeenServer] or null
@@ -206,7 +256,10 @@ module.exports = function playersDatabase(bot) {
         lastTried.delete(player.uuid);
         touchPlayer(player);
         const stored = data.ips[server]?.[player.uuid];
-        if (stored) player.ip = stored;
+        if (stored) {
+            player.ip = stored;
+            setIP(player.uuid, stored, server, Date.now());
+        }
     }
 
     function onPlayerRemove(pkt) {
@@ -241,6 +294,10 @@ module.exports = function playersDatabase(bot) {
 
     bot.playersDatabase = {
         getPlayerIP,
+        getPlayerIPs,
+        findPlayerIPs: getPlayerIPs,
+        getIPs: getPlayerIPs,
+        getPlayerIPHistory: getPlayerIPs,
         findPlayerAlts,
         getPlayerLastSeen,
         setIP,
