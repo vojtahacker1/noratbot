@@ -11,6 +11,14 @@
         "channelId": "1532880964852912360"
       },
       {
+        "id": "blackbox",
+        "enabled": true,
+        "host": "91.99.119.210",
+        "port": 25565,
+        "version": "26.1",
+        "username": "norat_bot"
+      }
+      {
         "id": "hceboom",
         "enabled": true,
         "host": "kaboom.hcesaropz.dev",
